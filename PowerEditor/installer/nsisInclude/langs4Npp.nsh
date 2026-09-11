@@ -155,9 +155,6 @@ SectionGroup "Localization" localization
 	${MementoUnselectedSection} "Korean" korean
 		CopyFiles "$PLUGINSDIR\nppLocalization\korean.xml" "$INSTDIR\localization\korean.xml"
 	${MementoSectionEnd}
-	${MementoUnselectedSection} "Lao" lao
-	    CopyFiles "$PLUGINSDIR\nppLocalization\lao.xml" "$INSTDIR\localization\lao.xml"
-	${MementoSectionEnd}
 	${MementoUnselectedSection} "Kurdish" kurdish
 		CopyFiles "$PLUGINSDIR\nppLocalization\kurdish.xml" "$INSTDIR\localization\kurdish.xml"
 	${MementoSectionEnd}
@@ -166,6 +163,9 @@ SectionGroup "Localization" localization
 	${MementoSectionEnd}
 	${MementoUnselectedSection} "Latvian" latvian
 		CopyFiles "$PLUGINSDIR\nppLocalization\latvian.xml" "$INSTDIR\localization\latvian.xml"
+	${MementoSectionEnd}
+	${MementoUnselectedSection} "Lao" lao
+	    CopyFiles "$PLUGINSDIR\nppLocalization\lao.xml" "$INSTDIR\localization\lao.xml"
 	${MementoSectionEnd}
 	${MementoUnselectedSection} "Ligurian" ligurian
 		CopyFiles "$PLUGINSDIR\nppLocalization\ligurian.xml" "$INSTDIR\localization\ligurian.xml"
