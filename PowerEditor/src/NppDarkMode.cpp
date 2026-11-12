@@ -36,6 +36,7 @@
 #include <cwchar>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "NppConstants.h"
 #include "Parameters.h"
@@ -2362,9 +2363,12 @@ namespace NppDarkMode
 		return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 	}
 
-	static void subclassListViewControl(HWND hwnd)
+	void subclassListViewControl(HWND hwnd)
 	{
-		SetWindowSubclass(hwnd, ListViewSubclass, static_cast<UINT_PTR>(SubclassID::darkMode), 0);
+		if (::GetWindowSubclass(hwnd, ListViewSubclass, static_cast<UINT_PTR>(SubclassID::darkMode), nullptr) == FALSE)
+		{
+			::SetWindowSubclass(hwnd, ListViewSubclass, static_cast<UINT_PTR>(SubclassID::darkMode), 0);
+		}
 	}
 
 	struct ProgressBarData
@@ -4788,6 +4792,17 @@ namespace NppDarkMode
 		}
 	}
 
+	static BOOL CALLBACK enumTaskModalProc(HWND hwnd, LPARAM lParam)
+	{
+		if (::IsWindowEnabled(hwnd) == TRUE
+			&& ::IsWindowVisible(hwnd) == TRUE)
+		{
+			::EnableWindow(hwnd, FALSE);
+			reinterpret_cast<std::vector<HWND>*>(lParam)->push_back(hwnd);
+		}
+		return TRUE;
+	}
+
 	static HRESULT darkTaskDialogIndirect(
 		const TASKDIALOGCONFIG* pTaskConfig,
 		int* pnButton,
@@ -4795,9 +4810,33 @@ namespace NppDarkMode
 		BOOL* pfVerificationFlagChecked
 	)
 	{
+		const bool isTaskModal = (static_cast<UINT>(pTaskConfig->lpCallbackData) & MB_MODEMASK) == MB_TASKMODAL
+			&& (pTaskConfig->hwndParent == nullptr);
+
+		std::vector<HWND> disabledWnds;
+		if (isTaskModal)
+		{
+			const_cast<TASKDIALOGCONFIG*>(pTaskConfig)->hwndParent = ::GetActiveWindow();
+			::EnumThreadWindows(::GetCurrentThreadId(), enumTaskModalProc, reinterpret_cast<LPARAM>(&disabledWnds));
+		}
+
 		::HookThemeColor();
 		const HRESULT retVal = ::TaskDialogIndirect(pTaskConfig, pnButton, pnRadioButton, pfVerificationFlagChecked);
 		::UnhookThemeColor();
+
+		if (isTaskModal)
+		{
+			for (auto it = disabledWnds.rbegin(); it != disabledWnds.rend(); ++it)
+			{
+				::EnableWindow(*it, TRUE);
+			}
+
+			if (!disabledWnds.empty())
+			{
+				::SetForegroundWindow(disabledWnds.front());
+			}
+		}
+
 		return retVal;
 	}
 
@@ -5019,7 +5058,12 @@ namespace NppDarkMode
 		const TASKDIALOGCONFIG tdc = msgBoxParamToTaskDlgConfig(hWnd, lpText, lpCaption, uType);
 
 		int btnPressed = 0;
-		if (darkTaskDialogIndirect(&tdc, &btnPressed, nullptr, nullptr) != S_OK)
+
+		const auto dpiContext = DPIManagerV2::setThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+		const bool retVal = darkTaskDialogIndirect(&tdc, &btnPressed, nullptr, nullptr) != S_OK;
+		DPIManagerV2::setThreadDpiAwarenessContext(dpiContext);
+
+		if (retVal)
 		{
 			return ::MessageBoxW(hWnd, lpText, lpCaption, uType);
 		}

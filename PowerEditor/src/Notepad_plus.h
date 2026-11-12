@@ -14,40 +14,59 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+
 #pragma once
 
-#include "ScintillaEditView.h"
-#include "DocTabView.h"
-#include "SplitterContainer.h"
-#include "FindReplaceDlg.h"
+#include <windows.h>
+
+#include <atomic>
+#include <cstdlib>
+#include <chrono>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <Scintilla.h>
+
 #include "AboutDlg.h"
-#include "RunDlg.h"
-#include "StatusBar.h"
-#include "lastRecentFileList.h"
-#include "GoToLineDlg.h"
-#include "FindCharsInRange.h"
-#include "columnEditor.h"
-#include "WordStyleDlg.h"
-#include "trayIconControler.h"
-#include "PluginsManager.h"
-#include "preferenceDlg.h"
-#include "WindowsDlg.h"
-#include "RunMacroDlg.h"
-#include "DockingManager.h"
-#include "Processus.h"
 #include "AutoCompletion.h"
-#include "SmartHighlighter.h"
+#include "Buffer.h"
+#include "ContextMenu.h"
+#include "DocTabView.h"
+#include "Docking.h"
+#include "DockingCont.h"
+#include "DockingDlgInterface.h"
+#include "DockingManager.h"
+#include "FindCharsInRange.h"
+#include "FindReplaceDlg.h"
+#include "GoToLineDlg.h"
+#include "Notepad_plus_msgs.h"
+#include "NppConstants.h"
+#include "Parameters.h"
+#include "PluginsManager.h"
+#include "RunDlg.h"
+#include "RunMacroDlg.h"
 #include "ScintillaCtrls.h"
-#include "lesDlgs.h"
-#include "pluginsAdmin.h"
-#include "localization.h"
+#include "ScintillaEditView.h"
+#include "SmartHighlighter.h"
+#include "SplitterContainer.h"
+#include "StatusBar.h"
+#include "ToolBar.h"
+#include "Window.h"
+#include "WindowsDlg.h"
+#include "WordStyleDlg.h"
+#include "columnEditor.h"
 #include "documentSnapshot.h"
+#include "lastRecentFileList.h"
+#include "lesDlgs.h"
+#include "localization.h"
 #include "md5Dlgs.h"
 #include "menuCmdID.h"
-#include <vector>
-#include <iso646.h>
-#include <chrono>
-#include <atomic>
+#include "pluginsAdmin.h"
+#include "preferenceDlg.h"
+#include "shortcut.h"
+#include "trayIconControler.h"
 
 extern std::chrono::steady_clock::time_point g_nppStartTimePoint;
 extern std::chrono::steady_clock::duration g_pluginsLoadingTime;
@@ -238,11 +257,11 @@ public:
 	void notifyBufferChanged(Buffer* buffer, int mask);
 	bool findInFinderFiles(FindersInfo* findInFolderInfo);
 
-	bool createFilelistForFiles(std::vector<std::wstring>& fileNames);
+	bool createFilelistForFiles(std::vector<SearchCandidate>& fileNames);
 	bool createFilelistForProjects(std::vector<std::wstring>& fileNames);
 	bool findInFiles();
 	bool findInProjects();
-	bool findInFilelist(std::vector<std::wstring>& fileList);
+	bool findInFilelist(std::vector<SearchCandidate>& fileList);
 	bool replaceInFiles();
 	bool replaceInProjects();
 	bool replaceInFilelist(std::vector<std::wstring>& fileList);
@@ -431,6 +450,8 @@ private:
 
 	std::vector<HWND> _sysTrayHiddenHwnd;
 
+	std::unordered_map<COLORREF, HBITMAP> _menuItemClrBitmaps;
+
 	BOOL notify(SCNotification *notification);
 	void command(int id);
 
@@ -470,6 +491,10 @@ private:
 	bool isEmpty(); // true if we have 1 view with 1 clean, untitled doc
 
 	int switchEditViewTo(int gid);	//activate other view (set focus etc)
+
+	ScintillaEditView* getInactiveScintView() {
+		return (_activeView == MAIN_VIEW ? &_subEditView : &_mainEditView);
+	}
 
 	void docGotoAnotherEditView(FileTransferMode mode);	//TransferMode
 	void docOpenInNewInstance(FileTransferMode mode, int x = 0, int y = 0);
@@ -597,11 +622,13 @@ private:
 
 	//void changeStyleCtrlsLang(HWND hDlg, int *idArray, const char **translatedText);
 	void setCodePageForInvisibleView(Buffer const* pBuffer);
+	void setCodePageForInvisibleView(UniMode unicodeMode);
 	bool replaceInOpenedFiles();
 	bool findInOpenedFiles();
 	bool findInCurrentFile(bool isEntireDoc);
 
 	void getMatchedFileNames(const wchar_t *dir, size_t level, const std::vector<std::wstring> & patterns, std::vector<std::wstring> & fileNames, bool isRecursive, bool isInHiddenDir, MatchedFileNameProgress* progress = nullptr);
+	void getMatchedFileNames(const wchar_t *dir, size_t level, const std::vector<std::wstring> & patterns, std::vector<SearchCandidate> & fileNames, bool isRecursive, bool isInHiddenDir, MatchedFileNameProgress* progress = nullptr);
 	void doSynScroll(HWND hW);
 	void setWorkingDir(const wchar_t *dir);
 

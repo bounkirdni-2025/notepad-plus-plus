@@ -17,12 +17,30 @@
 
 #pragma once
 
+#include <windows.h>
+
 #include <map>
-#include "FindReplaceDlg_rc.h"
-#include "ScintillaEditView.h"
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <BoostRegexSearch.h>
+#include <Scintilla.h>
+
+#include "Common.h"
+#include "ContextMenu.h"
 #include "DockingDlgInterface.h"
-#include "BoostRegexSearch.h"
+#include "FindReplaceDlg_rc.h"
+#include "Notepad_plus_msgs.h"
+#include "Parameters.h"
+#include "ScintillaEditView.h"
+#include "StaticDialog.h"
 #include "StatusBar.h"
+#include "TabBar.h"
+#include "ToolBar.h"
+#include "Window.h"
+#include "dpiManagerV2.h"
 
 #define FIND_RECURSIVE 1
 #define FIND_INHIDDENDIR 2
@@ -62,10 +80,11 @@ struct TargetRange {
 
 enum SearchIncrementalType { NotIncremental, FirstIncremental, NextIncremental };
 enum SearchType { FindNormal, FindExtended, FindRegex };
-enum ProcessOperation { ProcessFindAll, ProcessReplaceAll, ProcessCountAll, ProcessMarkAll, ProcessMarkAll_2, ProcessMarkAll_IncSearch, ProcessMarkAllExt, ProcessFindInFinder };
+enum ProcessOperation { ProcessFindAll, ProcessReplaceAll, ProcessCountAll, ProcessMarkAll, ProcessHighLightAll, ProcessMarkAll_IncSearch, ProcessMarkAllExt, ProcessFindInFinder };
 
 struct FindOption
 {
+	// In
 	bool _isWholeWord = true;
 	bool _isMatchCase = true;
 	bool _isWrapAround = true;
@@ -86,6 +105,9 @@ struct FindOption
 	bool _isProjectPanel_3 = false;
 	bool _dotMatchesNewline = false;
 	bool _isMatchLineNumber = false; // always false for main search
+
+	// Out
+	bool _regexEmptyStringFound = false; // used only for status bar tooltip display on countAll & markAll operations
 };
 
 struct MatchPosition
@@ -134,7 +156,7 @@ public:
 	void addFileNameTitle(const wchar_t * fileName);
 	void addFileHitCount(int count);
 	void addSearchResultInfo(int count, int countSearched, bool searchedEntireNotSelection, const FindOption *pFindOpt);
-	std::string foundLine(FoundInfo fi, SearchResultMarkingLine mi, const wchar_t* foundline, size_t foundLineLen, size_t totalLineNumber);
+	std::string foundLine(FoundInfo fi, SearchResultMarkingLine miLine, const wchar_t* foundline, size_t foundLineLen, size_t totalLineNumber);
 	void setFinderStyle();
 	void setFinderStyleForNpc(bool onlyColor = false);
 	void removeAll();
@@ -199,7 +221,7 @@ private:
 		_scintView.execute(SCI_SETREADONLY, isReadOnly);
 	}
 
-	bool isLineActualSearchResult(const std::wstring & s) const;
+	static bool isLineActualSearchResult(const std::wstring& s);
 	std::wstring & prepareStringForClipboard(std::wstring & s) const;
 
 	static FoundInfo EmptyFoundInfo;
@@ -286,12 +308,12 @@ public :
 	bool processReplace(const wchar_t* txt2find, const wchar_t* txt2replace, const FindOption* options = nullptr);
 
 	int markAll(const wchar_t* txt2find, int styleID);
-	int markAllInc(const FindOption* opt);
+	int markAllInc(FindOption* opt);
 
-	int processAll(ProcessOperation op, const FindOption* opt,
+	int processAll(ProcessOperation op, FindOption* opt,
 		bool isEntire = false, const FindersInfo *pFindersInfo = nullptr, int colourStyleID = -1, std::vector<MatchPosition>* pMatches = nullptr);
 	int processRange(ProcessOperation op, FindReplaceInfo& findReplaceInfo, const FindersInfo* pFindersInfo,
-		const FindOption* opt = nullptr, int colourStyleID = -1, ScintillaEditView* view2Process = nullptr, std::vector<MatchPosition>* pMatches = nullptr);
+		FindOption* opt = nullptr, int colourStyleID = -1, ScintillaEditView* view2Process = nullptr, std::vector<MatchPosition>* pMatches = nullptr);
 
 	void replaceAllInOpenedDocs();
 	void findAllIn(InWhat op);
@@ -310,7 +332,7 @@ public :
 	void getAndValidatePatterns(std::vector<std::wstring> & patternVect);
 
 	void setFindInFilesDirFilter(const wchar_t *dir, const wchar_t *filters);
-	void setProjectCheckmarks(FindHistory *findHistory, int Msk);
+	void setProjectCheckmarks(FindHistory* findHistory, int msk);
 	void enableProjectCheckmarks();
 
 	const std::wstring& getText2search() const {
@@ -422,14 +444,23 @@ public :
 	std::wstring getScopeInfoForStatusBar(FindOption const *pFindOpt) const;
 	Finder * createFinder();
 	bool removeFinder(Finder *finder2remove);
-	DIALOG_TYPE getCurrentStatus() { return _currentStatus; }
+	DIALOG_TYPE getCurrentStatus() const { return _currentStatus; }
 	Finder* getFinderFrom(HWND hwnd);
 	int regexBackwardMsgBox();
 	std::wstring setSearchText();
 	std::wstring setSearchTextWithSettings();
 
+	void updateMatchHighlighting();
+	void updateMatchHighlightingLater() const;
+	void clearMatchHighlighting();
+
 protected :
 	void resizeDialogElements();
+	void setMinHeightAndBordersMetrics() noexcept;
+
+	void setMonospaceFont();
+	void setFont();
+
 	intptr_t CALLBACK run_dlgProc(UINT message, WPARAM wParam, LPARAM lParam) override;
 
 	static LRESULT CALLBACK ComboEditProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
@@ -446,6 +477,7 @@ private:
 	DIALOG_TYPE _currentStatus = DIALOG_TYPE::FIND_DLG;
 
 	ScintillaEditView** _ppEditView = nullptr;
+	ScintillaEditView* _pMatchHighlightView = nullptr; // view of the last updateMatchHighlighting()
 	Finder  *_pFinder = nullptr;
 	std::wstring _findResTitle;
 
@@ -453,8 +485,11 @@ private:
 
 	HWND _shiftTrickUpTip = nullptr;
 	HWND _2ButtonsTip = nullptr;
+	HWND _confirmDlgTip = nullptr;
+	HWND _replaceAndStopTip = nullptr;
 	HWND _filterTip = nullptr;
 	HWND _dirFromActiveDocTip = nullptr;
+	HWND _hiliteModeTip = nullptr;
 
 	bool _isRTL = false;
 
@@ -480,11 +515,19 @@ private:
 
 	std::map<int, bool> _controlEnableMap;
 
-	std::vector<int> _reduce2hide_find = { IDC_IN_SELECTION_CHECK, IDC_REPLACEINSELECTION, IDC_FINDALL_CURRENTFILE, IDCANCEL };
-	std::vector<int> _reduce2hide_findReplace = { IDC_IN_SELECTION_CHECK, IDC_REPLACEINSELECTION, IDREPLACEALL, IDCANCEL };
-	std::vector<int> _reduce2hide_fif = { IDD_FINDINFILES_FILTERS_STATIC, IDD_FINDINFILES_FILTERS_COMBO, IDCANCEL };
-	std::vector<int> _reduce2hide_fip = { IDD_FINDINFILES_FILTERS_STATIC, IDD_FINDINFILES_FILTERS_COMBO, IDCANCEL };
-	std::vector<int> _reduce2hide_mark = { IDC_MARKLINE_CHECK, IDC_PURGE_CHECK, IDC_IN_SELECTION_CHECK, IDC_REPLACEINSELECTION, IDC_COPY_MARKED_TEXT, IDCANCEL };
+	static constexpr std::array _reduce2hide_match{ IDWHOLEWORD, IDMATCHCASE };
+	static constexpr std::array _reduce2hide_mode{ IDC_MODE_STATIC, IDNORMAL, IDEXTENDED, IDREGEXP, IDREDOTMATCHNL };
+	static constexpr std::array _reduce2hide_transparency{ IDC_TRANSPARENT_CHECK, IDC_TRANSPARENT_GRPBOX, IDC_TRANSPARENT_LOSSFOCUS_RADIO, IDC_TRANSPARENT_ALWAYS_RADIO, IDC_PERCENTAGE_SLIDER };
+	static constexpr std::array _reduce2hide_regex{ IDREDOTMATCHNL, IDC_BACKWARDDIRECTION, IDWHOLEWORD };
+
+	static constexpr std::array _reduce2hide_find{ IDC_BACKWARDDIRECTION, IDWRAP, IDC_IN_SELECTION_CHECK, IDC_REPLACEINSELECTION, IDC_FINDALL_CURRENTFILE, IDC_FINDALL_OPENEDFILES, IDCANCEL };
+	static constexpr std::array _reduce2hide_findReplace{ IDC_BACKWARDDIRECTION, IDWRAP, IDC_IN_SELECTION_CHECK, IDC_REPLACEINSELECTION,
+		IDC_REPLACEANDSTOP, IDREPLACEALL, IDC_REPLACE_OPENEDFILES, IDC_CONFIRMREPLACEOPENDOCS, IDCANCEL };
+	static constexpr std::array _reduce2hide_fif{ IDD_FINDINFILES_FILTERS_STATIC, IDD_FINDINFILES_FILTERS_COMBO, IDC_FIF_FILTER_TIP_STATIC,
+		IDD_FINDINFILES_DIR_STATIC, IDD_FINDINFILES_DIR_COMBO, IDD_FINDINFILES_BROWSE_BUTTON, IDD_FINDINFILES_SETDIRFROMDOC_BUTTON, IDD_FINDINFILES_RECURSIVE_CHECK, IDD_FINDINFILES_INHIDDENDIR_CHECK, IDCANCEL };
+	static constexpr std::array _reduce2hide_fip{ IDD_FINDINFILES_FILTERS_STATIC, IDD_FINDINFILES_FILTERS_COMBO, IDC_FIF_FILTER_TIP_STATIC,
+		IDD_FINDINFILES_PROJECT1_CHECK, IDD_FINDINFILES_PROJECT2_CHECK, IDD_FINDINFILES_PROJECT3_CHECK, IDCANCEL };
+	static constexpr std::array _reduce2hide_mark{ IDC_MARKLINE_CHECK, IDC_PURGE_CHECK, IDC_BACKWARDDIRECTION, IDWRAP, IDC_IN_SELECTION_CHECK, IDC_REPLACEINSELECTION, IDC_COPY_MARKED_TEXT, IDCANCEL };
 
 	ControlInfoTip _maxLenOnSearchTip;
 
@@ -493,7 +536,7 @@ private:
 
 	void enableFindDlgItem(int dlgItemID, bool isEnable = true);
 	void showFindDlgItem(int dlgItemID, bool isShow = true);
-
+	void layoutFindWhatAndHighlight();
 	void enableReplaceFunc(bool isEnable);
 	void enableFindInFilesControls(bool isEnable, bool projectPanels);
 	void enableFindInFilesFunc();
@@ -513,7 +556,7 @@ private:
 			_tab.activateAt(_currentStatus);
 	}
 	
-	FindStatus getFindStatus() {
+	FindStatus getFindStatus() const {
 		return _statusbarFindStatus;
 	}
 
@@ -556,7 +599,7 @@ public :
 
 	void setFindStatus(FindStatus iStatus, size_t nbCounted, int nth);
 
-	FindStatus getFindStatus() { return _findStatus; }
+	FindStatus getFindStatus() const { return _findStatus; }
 
 	void addToRebar(ReBar* rebar);
 

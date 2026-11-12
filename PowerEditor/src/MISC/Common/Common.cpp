@@ -21,6 +21,9 @@
 
 #include <commctrl.h>
 #include <excpt.h>
+#include <filesystem>
+#include <shellapi.h>
+#include <shlobj.h>
 #include <shlwapi.h>
 
 #include <algorithm>
@@ -39,18 +42,17 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <array>
 
 #include "Buffer.h"
 #include "CustomFileDialog.h"
 #include "FileInterface.h"
 #include "NppConstants.h"
 #include "NppDarkMode.h"
+#include "Parameters.h"
 #include "Utf8.h"
 #include "dpiManagerV2.h"
-
-#include <shlobj.h>
-#include <shellapi.h>
-#include <filesystem>
+#include "sha-256.h"
 
 using namespace std;
 
@@ -172,6 +174,16 @@ void writeFileContent(const wchar_t *file2write, const char *content2write)
 
 	if (file.isOpened())
 		file.writeStr(content2write);
+}
+
+DWORD writeFileContentEx(const wchar_t* file2write, const char* content2write, size_t length)
+{
+	Win32_IO_File file(file2write);
+
+	if (file.isOpened())
+		file.writeStr(content2write, length);
+
+	return file.getLastErrorCode();
 }
 
 
@@ -636,43 +648,6 @@ wstring convertFileName(T beg, T end)
 	return strTmp;
 }
 
-
-wstring intToString(int val)
-{
-	std::vector<wchar_t> vt;
-	bool isNegative = val < 0;
-	// can't use abs here because std::numeric_limits<int>::min() has no positive representation
-	//val = std::abs(val);
-
-	vt.push_back('0' + static_cast<wchar_t>(std::abs(val % 10)));
-	val /= 10;
-	while (val != 0)
-	{
-		vt.push_back('0' + static_cast<wchar_t>(std::abs(val % 10)));
-		val /= 10;
-	}
-
-	if (isNegative)
-		vt.push_back('-');
-
-	return wstring(vt.rbegin(), vt.rend());
-}
-
-wstring uintToString(unsigned int val)
-{
-	std::vector<wchar_t> vt;
-
-	vt.push_back('0' + static_cast<wchar_t>(val % 10));
-	val /= 10;
-	while (val != 0)
-	{
-		vt.push_back('0' + static_cast<wchar_t>(val % 10));
-		val /= 10;
-	}
-
-	return wstring(vt.rbegin(), vt.rend());
-}
-
 // Build Recent File menu entries from given
 wstring BuildMenuFileName(int filenameLen, unsigned int pos, const wstring &filename, bool ordinalNumber)
 {
@@ -692,9 +667,9 @@ wstring BuildMenuFileName(int filenameLen, unsigned int pos, const wstring &file
 		else
 		{
 			div_t splitDigits = div(pos + 1, 10);
-			strTemp.append(uintToString(splitDigits.quot));
+			strTemp.append(std::to_wstring(splitDigits.quot));
 			strTemp.push_back('&');
-			strTemp.append(uintToString(splitDigits.rem));
+			strTemp.append(std::to_wstring(splitDigits.rem));
 		}
 		strTemp.append(L": ");
 	}
@@ -1702,8 +1677,14 @@ wstring getDateTimeStrFrom(const wstring& dateTimeFormat, const SYSTEMTIME& st)
 // Don't forget to use DeleteObject(createdFont) before leaving the program
 HFONT createFont(const wchar_t* fontName, int fontSize, bool isBold, HWND hDestParent)
 {
+	auto dlgFontSize = static_cast<WORD>(fontSize);
+	if (dlgFontSize == 0)
+	{
+		dlgFontSize = NppParameters::getInstance().getDlgFontSize();
+	}
+
 	LOGFONT logFont{};
-	const int fontSizeScaled = DPIManagerV2::scaleFontForFactor(fontSize);
+	const int fontSizeScaled = DPIManagerV2::scaleFontForFactor(dlgFontSize);
 	logFont.lfHeight = DPIManagerV2::scaleFont(fontSizeScaled, hDestParent);
 	if (isBold)
 		logFont.lfWeight = FW_BOLD;
@@ -2647,4 +2628,24 @@ bool needsElevation4Access(const std::wstring& path2check, bool bWriteAccess)
 
 	// an elevation will not help us here (HW R/O, file-in-use locks, complex restrictive ACLs, etc.)
 	return false;
+}
+
+bool nppCopyDataDigest(ULONG_PTR dwData, const void* data, DWORD cb, NppDigest& out)
+{
+	if (cb != 0 && data == nullptr)
+		return false;
+
+	// calc_sha_256 hashes one contiguous buffer, so build "tag | length | data" first
+	const uint64_t tag = dwData;
+	const uint32_t len = cb;
+
+	std::vector<uint8_t> buf(sizeof(tag) + sizeof(len) + cb);
+	memcpy(buf.data(), &tag, sizeof(tag));
+	memcpy(buf.data() + sizeof(tag), &len, sizeof(len));
+	if (cb != 0)
+		memcpy(buf.data() + sizeof(tag) + sizeof(len), data, cb);
+
+	calc_sha_256(out.data(), buf.data(), buf.size());
+
+	return true;
 }

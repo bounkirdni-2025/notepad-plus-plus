@@ -15,30 +15,69 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-#include <algorithm>
+#include <windows.h>
+
 #include <shlwapi.h>
 #include <uxtheme.h> // for EnableThemeDialogTexture
-#include <format>
 #include <windowsx.h> // for GET_X_LPARAM, GET_Y_LPARAM
+
+#include <algorithm>
 #include <atomic>
+#include <cassert>
+#include <cstdlib>
+#include <cstring>
+#include <cwchar>
+#include <exception>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <ILexer.h>
+#include <Lexilla.h>
+#include <SciLexer.h>
+#include <Scintilla.h>
+#include <Utf8_16.h>
+
+#include "AutoCompletion.h"
+#include "Buffer.h"
+#include "Common.h"
+#include "ContextMenu.h"
+#include "DocTabView.h"
+#include "Docking.h"
+#include "DockingCont.h"
+#include "FindReplaceDlg.h"
+#include "Notepad_plus.h"
 #include "Notepad_plus_Window.h"
-#include "TaskListDlg.h"
+#include "Notepad_plus_msgs.h"
+#include "NppConstants.h"
+#include "NppDarkMode.h"
+#include "Parameters.h"
+#include "PluginInterface.h"
+#include "Processus.h"
+#include "ProjectPanel.h"
+#include "RunDlg.h"
+#include "ScintillaEditView.h"
 #include "ShortcutMapper.h"
+#include "TabBar.h"
+#include "TaskListDlg.h"
+#include "ToolBar.h"
+#include "VerticalFileSwitcher.h"
+#include "WindowsDlg.h"
+#include "WordStyleDlg.h"
 #include "ansiCharPanel.h"
 #include "clipboardHistoryPanel.h"
-#include "VerticalFileSwitcher.h"
-#include "ProjectPanel.h"
+#include "colors.h"
 #include "documentMap.h"
-#include "functionListPanel.h"
+#include "dpiManagerV2.h"
 #include "fileBrowser.h"
-#include "NppDarkMode.h"
-#include "NppConstants.h"
+#include "functionListPanel.h"
+#include "menuCmdID.h"
+#include "preference_rc.h"
+#include "resource.h"
+#include "shortcut.h"
+#include "trayIconControler.h"
 
 using namespace std;
-
-#ifndef WM_DPICHANGED
-#define WM_DPICHANGED 0x02E0
-#endif
 
 std::atomic<bool> g_bNppExitFlag{ false };
 const UINT WM_TASKBARCREATED = ::RegisterWindowMessage(L"TaskbarCreated");
@@ -64,7 +103,7 @@ struct SortTaskListPred final
 };
 
 // app-restart feature needs Win10 20H1+ (builds 18963+), but it was quietly introduced earlier in the Fall Creators Update (b1709+)
-bool SetOSAppRestart()
+static bool SetOSAppRestart()
 {
 	NppParameters& nppParam = NppParameters::getInstance();
 	if (nppParam.getWinVersion() < WV_WIN10)
@@ -125,11 +164,10 @@ bool SetOSAppRestart()
 	return bRet;
 }
 
-static bool isSenderTrusted(WPARAM wParam)
+static bool isSenderTrusted(HWND hSenderWnd)
 {
-	HWND hSenderWnd = reinterpret_cast<HWND>(wParam);
 	if (hSenderWnd == NULL || !::IsWindow(hSenderWnd))
-		return false; // no real window handle presented -> reject
+		return false;
 
 	DWORD dwProcessId = 0;
 	if (::GetWindowThreadProcessId(hSenderWnd, &dwProcessId) == 0 || dwProcessId == 0)
@@ -166,6 +204,8 @@ static bool isSenderTrusted(WPARAM wParam)
 	// Executable identity: require it to be this same binary (another Notepad++ instance with the same path)
 	if (isTrusted)
 	{
+		isTrusted = false; // reset
+
 		wchar_t senderImagePath[MAX_PATH]{};
 		DWORD dwSizeSender = MAX_PATH;
 		wchar_t selfImagePath[MAX_PATH]{};
@@ -174,11 +214,16 @@ static bool isSenderTrusted(WPARAM wParam)
 		if (::QueryFullProcessImageNameW(hProcess, 0, senderImagePath, &dwSizeSender) &&
 			::QueryFullProcessImageNameW(::GetCurrentProcess(), 0, selfImagePath, &dwSizeSelf))
 		{
-			isTrusted = (_wcsicmp(senderImagePath, selfImagePath) == 0);
-		}
-		else
-		{
-			isTrusted = false;
+			// unfortunately, while the QueryFullProcessImageName translates a symlink image module path stored in the process PEB to the original fullpath,
+			// it OTOH leaves the possibly used short 8.3 path there intact (e.g. Notepad++ launched via CMD "C:\Progra~1\Notepad++\notepad++.exe"),
+			// so we have to ensure the final consistency in-between the compared paths ourselves
+			wchar_t senderImageLongPath[MAX_PATH]{};
+			wchar_t selfImageLongPath[MAX_PATH]{};
+			if ((::GetLongPathNameW(senderImagePath, senderImageLongPath, MAX_PATH) > 0) &&
+				(::GetLongPathNameW(selfImagePath, selfImageLongPath, MAX_PATH) > 0))
+			{
+				isTrusted = (_wcsicmp(senderImageLongPath, selfImageLongPath) == 0);
+			}
 		}
 	}
 
@@ -258,7 +303,7 @@ LRESULT Notepad_plus_Window::runProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 }
 
 // Used by NPPM_GETFILENAMEATCURSOR
-int CharacterIs(wchar_t c, const wchar_t *any)
+static int CharacterIs(wchar_t c, const wchar_t *any)
 {
 	int i;
 	for (i = 0; any[i] != 0; i++)
@@ -790,12 +835,24 @@ LRESULT Notepad_plus::process(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 				_pDocMap->reloadMap();
 			}
 
+			// Close AutoComplete and CallTip
+			_mainEditView.execute(SCI_AUTOCCANCEL);
+			_subEditView.execute(SCI_AUTOCCANCEL);
+			_mainEditView.execute(SCI_CALLTIPCANCEL);
+			_subEditView.execute(SCI_CALLTIPCANCEL);
+
 			result = TRUE;
 			break;
 		}
 
 		case WM_MOVE:
 		{
+			// Close AutoComplete and CallTip
+			_mainEditView.execute(SCI_AUTOCCANCEL);
+			_subEditView.execute(SCI_AUTOCCANCEL);
+			_mainEditView.execute(SCI_CALLTIPCANCEL);
+			_subEditView.execute(SCI_CALLTIPCANCEL);
+
 			result = TRUE;
 			break;
 		}
@@ -821,29 +878,54 @@ LRESULT Notepad_plus::process(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 			if (lParam == 0)
 				return TRUE; // invalid
 
-			if (!isSenderTrusted(wParam))
+			HWND claimed = reinterpret_cast<HWND>(wParam);
+
+			// Enshre the binary identity (full path) via recieved HWND 
+			if (!isSenderTrusted(claimed))
 				return TRUE; // reject: not another trusted instance of this same binary
 
 			COPYDATASTRUCT* pCopyData = reinterpret_cast<COPYDATASTRUCT*>(lParam);
-			if (pCopyData->lpData == nullptr)
+			if (pCopyData->lpData == nullptr || pCopyData->cbData == 0)
 				return TRUE; // invalid
+
+			if (pCopyData->dwData == NPP_COPYDATA_CONFIRM)
+				return TRUE;
+
+			// Ensure the data integrity via digest check
+			NppDigest dg;
+			if (!nppCopyDataDigest(pCopyData->dwData, pCopyData->lpData, pCopyData->cbData, dg))
+				return TRUE;
+
+			// Send back a confirmation message to the sender, so it can verify the integrity of the data
+			// Note: we will wait for the response NPP_CONFIRM_MAGIC for 1 second, then we will give up and ignore the data
+			COPYDATASTRUCT q { NPP_COPYDATA_CONFIRM, static_cast<DWORD>(dg.size()), dg.data() };
+			DWORD_PTR res = 0;
+			if (!::SendMessageTimeoutW(claimed, WM_COPYDATA, reinterpret_cast<WPARAM>(hwnd), reinterpret_cast<LPARAM>(&q), SMTO_ABORTIFHUNG | SMTO_BLOCK, 1000, &res)
+				|| res != static_cast<DWORD_PTR>(NPP_CONFIRM_MAGIC))
+				return TRUE;
 
 			switch (pCopyData->dwData)
 			{
 				case COPYDATA_FULL_CMDLINE:
 				{
-					wchar_t* str2set = static_cast<wchar_t*>(pCopyData->lpData);
-					nppParam.setCmdLineString(str2set);
+					if (!_isAdministrator)
+					{
+						wchar_t* str2set = static_cast<wchar_t*>(pCopyData->lpData);
+						nppParam.setCmdLineString(str2set);
+					}
 					break;
 				}
 
 				case COPYDATA_PARAMS:
 				{
-					const CmdLineParamsDTO* cmdLineParam = static_cast<const CmdLineParamsDTO*>(pCopyData->lpData); // CmdLineParams object from another instance, but the same binary
+					CmdLineParamsDTO* cmdLineParam = static_cast<CmdLineParamsDTO*>(pCopyData->lpData); // CmdLineParams object from another instance, but the same binary
 					const DWORD cmdLineParamsSize = pCopyData->cbData; // CmdLineParams size from another instance
 					if (sizeof(CmdLineParamsDTO) == cmdLineParamsSize) // make sure the structure is the same
 					{
-						nppParam.setCmdlineParam(*cmdLineParam); // need to be guarded for possible invalid ptr passed
+						if (_isAdministrator)
+							cmdLineParam->_pluginMessage[0] = L'\0';
+
+						nppParam.setCmdlineParam(*cmdLineParam);
 
 						wstring pluginMessage{ nppParam.getCmdLineParams()._pluginMessage };
 						if (!pluginMessage.empty())
@@ -856,7 +938,7 @@ LRESULT Notepad_plus::process(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 						}
 
 						NppGUI& nppGui = nppParam.getNppGUI();
-						nppGui._isCmdlineNosessionActivated = cmdLineParam->_isNoSession; // need to be guarded for possible invalid ptr passed
+						nppGui._isCmdlineNosessionActivated = cmdLineParam->_isNoSession;
 					}
 					break;
 				}
@@ -864,6 +946,18 @@ LRESULT Notepad_plus::process(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 				case COPYDATA_FILENAMESW:
 				{
 					wchar_t* fileNamesW = static_cast<wchar_t*>(pCopyData->lpData);
+
+					size_t maxChars = pCopyData->cbData / sizeof(wchar_t);
+					size_t stringLen = wcsnlen_s(fileNamesW, maxChars);
+
+					// If stringLen equals maxChars, wcsnlen_s hit the limit 
+					// without finding a L'\0', meaning it is NOT properly null-terminated
+					if (stringLen >= maxChars)
+					{
+						// Malformed or malicious input: drop/reject the message
+						break;
+					}
+
 					const CmdLineParamsDTO& cmdLineParams = nppParam.getCmdLineParams();
 					loadCommandlineParams(fileNamesW, &cmdLineParams);
 					break;
@@ -2401,7 +2495,7 @@ LRESULT Notepad_plus::process(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 			const NppGUI & nppgui = nppParam.getNppGUI();
 			if (nppgui._fileAutoDetection != cdDisabled)
 			{
-				bool bCheckOnlyCurrentBuffer = (nppgui._fileAutoDetection & cdEnabledNew) ? true : false;
+				bool bCheckOnlyCurrentBuffer = (nppgui._fileAutoDetection & cdEnabled4CurrentFile) ? true : false;
 				checkModifiedDocument(bCheckOnlyCurrentBuffer);
 				return TRUE;
 			}
@@ -2565,7 +2659,6 @@ LRESULT Notepad_plus::process(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 				{
 					_pClipboardHistoryPanel->setBackgroundColor(pStyle->_bgColor);
 					_pClipboardHistoryPanel->setForegroundColor(pStyle->_fgColor);
-					_pClipboardHistoryPanel->redraw(true);
 				}
 
 				if (pStyle && _pProjectPanel_1)
@@ -2671,6 +2764,36 @@ LRESULT Notepad_plus::process(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 		{
 			_mainEditView.execute(SCI_SETDRAGDROPENABLED, !nppParam.getSVP()._disableSelectedTextDragDrop);
 			_subEditView.execute(SCI_SETDRAGDROPENABLED, !nppParam.getSVP()._disableSelectedTextDragDrop);
+			return TRUE;
+		}
+
+
+		case NPPM_INTERNAL_INCSEARCHBARPOSITION:
+		{
+			ReBar& rebar = nppParam.getFindHistory()._incrementalSearchBarAtTop ? _rebarTop : _rebarBottom;
+			if (::GetParent(_incrementFindDlg.getHSelf()) == rebar.getHSelf()) // already there: a rebar is the parent of its band windows
+				return TRUE;
+
+			// hide the band before removing it: a rebar would keep the height of a visible band
+			bool isShown = _incrementFindDlg.isVisible();
+			if (isShown)
+				_incrementFindDlg.display(false);
+
+			_incrementFindDlg.destroy(); // removes the band only
+			_incrementFindDlg.addToRebar(&rebar);
+
+			if (isShown)
+				rebar.setIDVisible(REBAR_BAR_SEARCH, true);
+
+			::SendMessage(hwnd, WM_SIZE, 0, 0);
+			return TRUE;
+		}
+
+		case NPPM_INTERNAL_FINDDLGHIGHLIGHT:
+		{
+			if (_findReplaceDlg.isCreated())
+				_findReplaceDlg.updateMatchHighlighting();
+
 			return TRUE;
 		}
 
@@ -3892,6 +4015,9 @@ LRESULT Notepad_plus::process(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
 		{
 			const UINT dpi = LOWORD(wParam);
 			_toolBar.resizeIconsDpi(dpi);
+
+			_mainEditView.setWhitespaceSize();
+			_subEditView.setWhitespaceSize();
 
 			_mainDocTab.dpiManager().setDpi(dpi);
 			_subDocTab.dpiManager().setDpi(dpi);

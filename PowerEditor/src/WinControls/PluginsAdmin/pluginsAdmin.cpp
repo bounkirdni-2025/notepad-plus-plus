@@ -144,16 +144,16 @@ long PluginsAdminDlg::searchFromCurrentSel(const PluginViewList& inWhichList, co
 	return -1;
 }
 
-void PluginsAdminDlg::create(int dialogID, bool isRTL, bool msgDestParent, WORD fontSize)
+void PluginsAdminDlg::create(int dialogID, bool isRTL, bool msgDestParent, WORD fontSize, const std::wstring& fontFace)
 {
 	// get plugin installation path and launch mode (Admin or normal)
 	collectNppCurrentStatusInfos();
 
-	StaticDialog::create(dialogID, isRTL, msgDestParent, fontSize);
+	StaticDialog::create(dialogID, isRTL, msgDestParent, fontSize, fontFace);
 
 	RECT rect{};
 	getClientRect(rect);
-	_tab.init(_hInst, _hSelf, false, true);
+	_tab.init(_hInst, _hSelf, false, false);
 
 	const wchar_t *available = L"Available";
 	const wchar_t *updates = L"Updates";
@@ -198,10 +198,10 @@ void PluginsAdminDlg::create(int dialogID, bool isRTL, bool msgDestParent, WORD 
 	const size_t szColVer = _dpiManager.scale(100);
 	const size_t szColName = szColVer * 2;
 
+	auto hFont = reinterpret_cast<HFONT>(::SendMessage(_hSelf, WM_GETFONT, 0, 0));
 	auto initListView = [&](PluginViewList& list) -> void {
 		list.addColumn(columnInfo(pluginStr, szColName));
 		list.addColumn(columnInfo(vesionStr, szColVer));
-		list.setViewStyleOption(LVS_EX_CHECKBOXES);
 		list.initView(_hInst, _hSelf);
 		const HWND hList = list.getViewHwnd();
 		ListView_SetBkColor(hList, bgColor);
@@ -211,6 +211,7 @@ void PluginsAdminDlg::create(int dialogID, bool isRTL, bool msgDestParent, WORD 
 		::SetWindowLongPtr(hList, GWL_STYLE, style | WS_TABSTOP);
 		::SetWindowPos(hList, ::GetDlgItem(_hSelf, IDC_PLUGINADM_RESEARCH_NEXT), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE); // to allow tab switch
 		list.reSizeView(listRect);
+		::SendMessage(list.getViewHwnd(), WM_SETFONT, reinterpret_cast<WPARAM>(hFont), MAKELPARAM(TRUE, 0));
 	};
 
 	initListView(_availableList);
@@ -222,7 +223,6 @@ void PluginsAdminDlg::create(int dialogID, bool isRTL, bool msgDestParent, WORD 
 	switchDialog(0);
 
 	NppDarkMode::autoSubclassAndThemeChildControls(_hSelf);
-	NppDarkMode::autoSubclassAndThemeWindowNotify(_hSelf);
 
 	HWND hPluginListVersionNumber = ::GetDlgItem(_hSelf, IDC_PLUGINLIST_VERSIONNUMBER_STATIC);
 	::SetWindowText(hPluginListVersionNumber, _pluginListVersion.c_str());
@@ -1473,6 +1473,7 @@ intptr_t CALLBACK PluginsAdminDlg::run_dlgProc(UINT message, WPARAM wParam, LPAR
 		case WM_DPICHANGED:
 		{
 			_dpiManager.setDpiWP(wParam);
+			auto hFont = reinterpret_cast<HFONT>(::SendMessage(_hSelf, WM_GETFONT, 0, 0));
 
 			const size_t szColVer = _dpiManager.scale(100);
 			const size_t szColName = szColVer * 2;
@@ -1480,7 +1481,8 @@ intptr_t CALLBACK PluginsAdminDlg::run_dlgProc(UINT message, WPARAM wParam, LPAR
 			auto setListViewSize = [&](PluginViewList& list) -> void {
 				ListView_SetColumnWidth(list.getViewHwnd(), 0, szColName);
 				ListView_SetColumnWidth(list.getViewHwnd(), 1, szColVer);
-				};
+				::SendMessage(list.getViewHwnd(), WM_SETFONT, reinterpret_cast<WPARAM>(hFont), MAKELPARAM(TRUE, 0));
+			};
 			
 			setListViewSize(_availableList);
 			setListViewSize(_updateList);

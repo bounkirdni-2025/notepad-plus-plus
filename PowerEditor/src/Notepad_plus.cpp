@@ -14,36 +14,88 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+
 #include "Notepad_plus.h"
+
+#include <windows.h>
 
 #include <shlwapi.h>
 #include <wininet.h>
 
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cctype>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
+#include <exception>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <string.h>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+#include <wchar.h>
 
-#include "NppXml.h"
-#include "Notepad_plus_Window.h"
+#include <SciLexer.h>
+#include <Sci_Position.h>
+#include <Scintilla.h>
+
+#include "AboutDlg.h"
+#include "AutoCompletion.h"
+#include "Buffer.h"
+#include "Common.h"
+#include "ContextMenu.h"
 #include "CustomFileDialog.h"
-#include "Printer.h"
-#include "FileNameStringSplitter.h"
-#include "lesDlgs.h"
-#include "Utf8_16.h"
-#include "RunDlg.h"
-#include "preferenceDlg.h"
-#include "TaskListDlg.h"
+#include "DocTabView.h"
+#include "Docking.h"
+#include "DockingCont.h"
+#include "DockingDlgInterface.h"
 #include "EncodingMapper.h"
+#include "FileNameStringSplitter.h"
+#include "FindReplaceDlg.h"
+#include "ImageListSet.h"
+#include "Notepad_plus_Window.h"
+#include "Notepad_plus_msgs.h"
+#include "NppConstants.h"
+#include "NppDarkMode.h"
+#include "NppXml.h"
+#include "Parameters.h"
+#include "PluginInterface.h"
+#include "Printer.h"
+#include "ProjectPanel.h"
+#include "RunDlg.h"
+#include "ScintillaEditView.h"
+#include "Splitter.h"
+#include "SplitterContainer.h"
+#include "StaticDialog.h"
+#include "TabBar.h"
+#include "TaskListDlg.h"
+#include "ToolBar.h"
+#include "UserDefineDialog.h"
+#include "UserDefineResource.h"
+#include "VerticalFileSwitcher.h"
+#include "Window.h"
+#include "WordStyleDlg.h"
 #include "ansiCharPanel.h"
 #include "clipboardHistoryPanel.h"
-#include "VerticalFileSwitcher.h"
-#include "ProjectPanel.h"
 #include "documentMap.h"
-#include "functionListPanel.h"
-#include "fileBrowser.h"
-#include "Common.h"
-#include "NppDarkMode.h"
 #include "dpiManagerV2.h"
-#include "ImageListSet.h"
+#include "fileBrowser.h"
+#include "functionListPanel.h"
+#include "lesDlgs.h"
+#include "localization.h"
+#include "md5Dlgs.h"
+#include "menuCmdID.h"
+#include "preferenceDlg.h"
+#include "preference_rc.h"
+#include "resource.h"
+#include "shortcut.h"
+#include "trayIconControler.h"
 
 using namespace std;
 
@@ -202,6 +254,16 @@ Notepad_plus::~Notepad_plus()
 	delete _pDocMap;
 	delete _pFuncList;
 	delete _pFileBrowser;
+
+	for (auto& element : _menuItemClrBitmaps)
+	{
+		if (element.second != nullptr)
+		{
+			::DeleteObject(element.second);
+			element.second = nullptr;
+		}
+	}
+	_menuItemClrBitmaps.clear();
 }
 
 
@@ -742,7 +804,7 @@ LRESULT Notepad_plus::init(HWND hwnd)
 	_findReplaceDlg.init(_pPublicInterface->getHinst(), hwnd, &_pEditView);
 	_findInFinderDlg.init(_pPublicInterface->getHinst(), hwnd);
 	_incrementFindDlg.init(_pPublicInterface->getHinst(), hwnd, &_findReplaceDlg, _nativeLangSpeaker.isRTL());
-	_incrementFindDlg.addToRebar(&_rebarBottom);
+	_incrementFindDlg.addToRebar(nppParam.getFindHistory()._incrementalSearchBarAtTop ? &_rebarTop : &_rebarBottom);
 	_goToLineDlg.init(_pPublicInterface->getHinst(), hwnd, &_pEditView);
 	_findCharsInRangeDlg.init(_pPublicInterface->getHinst(), hwnd, &_pEditView);
 	_colEditorDlg.init(_pPublicInterface->getHinst(), hwnd, &_pEditView);
@@ -1242,9 +1304,14 @@ int Notepad_plus::getHtmlXmlEncoding(const wchar_t* fileName) const
 
 void Notepad_plus::setCodePageForInvisibleView(Buffer const *pBuffer)
 {
+	setCodePageForInvisibleView(pBuffer->getUnicodeMode());
+}
+
+void Notepad_plus::setCodePageForInvisibleView(UniMode unicodeMode)
+{
 	intptr_t detectedCp = _invisibleEditView.execute(SCI_GETCODEPAGE);
 	intptr_t cp2set = SC_CP_UTF8;
-	if (pBuffer->getUnicodeMode() == uni8Bit)
+	if (unicodeMode == uni8Bit)
 	{
 		cp2set = (detectedCp == SC_CP_UTF8 ? CP_ACP : detectedCp);
 	}
@@ -1833,21 +1900,29 @@ void Notepad_plus::removeDuplicateLines()
 class MatchedFileNameProgress final
 {
 public:
+	static constexpr std::chrono::milliseconds updateInterval{ 50 }; // 20 Hz; enough for the progress dialog
+
 	explicit MatchedFileNameProgress(Progress & progress) : _pProgress(&progress) {}
+
+	bool due() const
+	{
+		return std::chrono::steady_clock::now() - _pLastUpdateTime >= updateInterval;
+	}
+
+	void noteUpdated()
+	{
+		_pLastUpdateTime = std::chrono::steady_clock::now();
+	}
+
 	// Updates progress if enough time has passed and returns whether search should continue
 	bool report(const wchar_t * currentPath, int nbHitsSoFar)
 	{
-		static constexpr std::chrono::milliseconds updateInterval{ 50 };
-		const auto now = std::chrono::steady_clock::now();
-		if (now - _pLastUpdateTime >= updateInterval)
-		{
-			if (_pProgress->isCancelled())
-			{
-				return false;
-			}
-			_pLastUpdateTime = now;
-			_pProgress->setInfo(currentPath, nbHitsSoFar);
-		}
+		if (!due())
+			return true;
+		if (_pProgress->isCancelled())
+			return false;
+		_pProgress->setInfo(currentPath, nbHitsSoFar);
+		noteUpdated();
 		return true;
 	}
 private:
@@ -1856,6 +1931,17 @@ private:
 };
 
 void Notepad_plus::getMatchedFileNames(const wchar_t *dir, size_t level, const vector<wstring> & patterns, vector<wstring> & fileNames, bool isRecursive, bool isInHiddenDir, MatchedFileNameProgress* progress)
+{
+	vector<SearchCandidate> files;
+	getMatchedFileNames(dir, level, patterns, files, isRecursive, isInHiddenDir, progress);
+	fileNames.reserve(fileNames.size() + files.size());
+	for (auto&& file : files)
+	{
+		fileNames.push_back(std::move(file._path));
+	}
+}
+
+void Notepad_plus::getMatchedFileNames(const wchar_t *dir, size_t level, const vector<wstring> & patterns, vector<SearchCandidate> & fileNames, bool isRecursive, bool isInHiddenDir, MatchedFileNameProgress* progress)
 {
 	level++;
 
@@ -1893,7 +1979,10 @@ void Notepad_plus::getMatchedFileNames(const wchar_t *dir, size_t level, const v
 				{
 					wstring pathFile(dir);
 					pathFile += foundData.cFileName;
-					fileNames.push_back(pathFile.c_str());
+					LARGE_INTEGER fileSize{};
+					fileSize.LowPart = foundData.nFileSizeLow;
+					fileSize.HighPart = foundData.nFileSizeHigh;
+					fileNames.push_back(SearchCandidate{ std::move(pathFile), fileSize.QuadPart });
 				}
 			}
 
@@ -1906,7 +1995,7 @@ void Notepad_plus::getMatchedFileNames(const wchar_t *dir, size_t level, const v
 	}
 }
 
-bool Notepad_plus::createFilelistForFiles(vector<wstring> & fileNames)
+bool Notepad_plus::createFilelistForFiles(vector<SearchCandidate> & fileNames)
 {
 	const wchar_t *dir2Search = _findReplaceDlg.getDir2Search();
 	if (!dir2Search[0] || !doesDirectoryExist(dir2Search))
@@ -1961,9 +2050,14 @@ bool Notepad_plus::replaceInFiles()
 {
 	std::lock_guard<std::mutex> lock(replaceInFiles_mutex);
 
-	std::vector<wstring> fileNames;
-	if (!createFilelistForFiles(fileNames))
+	std::vector<SearchCandidate> fileList;
+	if (!createFilelistForFiles(fileList))
 		return false;
+
+	std::vector<wstring> fileNames;
+	fileNames.reserve(fileList.size());
+	for (const auto& file : fileList)
+		fileNames.push_back(file._path);
 
 	return replaceInFilelist(fileNames);
 }
@@ -2099,29 +2193,29 @@ bool Notepad_plus::findInFinderFiles(FindersInfo *findInFolderInfo)
 	Progress progress(_pPublicInterface->getHinst());
 
 	size_t filesCount = fileNames.size();
-	size_t filesPerPercent = 1;
 
 	if (filesCount > 1)
 	{
-		if (filesCount >= 200)
-			filesPerPercent = filesCount / 100;
-		
 		wstring msg = _nativeLangSpeaker.getLocalizedStrFromID("find-in-files-progress-title", L"Find In Files progress...");
 		progress.open(_findReplaceDlg.getHSelf(), msg.c_str());
 	}
 
-	for (size_t i = 0, updateOnCount = filesPerPercent; i < filesCount; ++i)
+	NppParameters& nppParam = NppParameters::getInstance();
+	const NppGUI& nppGui = nppParam.getNppGUI();
+
+	Document scratchDoc = MainFileManager.createSearchDocument();
+	MatchedFileNameProgress progressUi(progress);
+
+	for (size_t i = 0; i < filesCount; ++i)
 	{
 		if (progress.isCancelled()) break;
 
-		bool closeBuf = false;
-		BufferID id = MainFileManager.getBufferFromName(fileNames.at(i).c_str());
-		if (id == BUFFER_INVALID)
-		{
-			id = MainFileManager.loadFile(fileNames.at(i).c_str());
-			closeBuf = true;
-		}
+		const wchar_t* filePath = fileNames.at(i).c_str();
+		findInFolderInfo->_pFileName = filePath;
 
+		BufferID id = nppGui._fif_ignoreunsavedChangesInOpenedFiles ? BUFFER_INVALID : MainFileManager.getBufferFromName(filePath);
+
+		int nb = 0;
 		if (id != BUFFER_INVALID)
 		{
 			Buffer * pBuf = MainFileManager.getBufferByID(id);
@@ -2129,30 +2223,32 @@ bool Notepad_plus::findInFinderFiles(FindersInfo *findInFolderInfo)
 
 			setCodePageForInvisibleView(pBuf);
 
-			findInFolderInfo->_pFileName = fileNames.at(i).c_str();
-			
-			int nb = _findReplaceDlg.processAll(ProcessFindInFinder, &(findInFolderInfo->_findOption), true, findInFolderInfo);
-			if (nb == FIND_INVALID_REGULAR_EXPRESSION)
-			{
-				break;
-			}
-			else
-			{
-				nbTotal += nb;
-			}
+			nb = _findReplaceDlg.processAll(ProcessFindInFinder, &(findInFolderInfo->_findOption), true, findInFolderInfo);
+		}
+		else if (scratchDoc)
+		{
+			if (_invisibleEditView.execute(SCI_GETDOCPOINTER) != scratchDoc)
+				_invisibleEditView.execute(SCI_SETDOCPOINTER, 0, scratchDoc);
 
-			if (closeBuf)
-				MainFileManager.closeBuffer(id, _pEditView);
+			SearchLoadResult loaded = MainFileManager.loadFileContentForSearch({ scratchDoc, filePath, -1, &_invisibleEditView });
+			if (loaded._ok)
+			{
+				_invisibleEditView.execute(SCI_SETCODEPAGE, 0);
+				setCodePageForInvisibleView(loaded._unicodeMode);
+
+				nb = _findReplaceDlg.processAll(ProcessFindInFinder, &(findInFolderInfo->_findOption), true, findInFolderInfo);
+			}
 		}
 
-		if (i == updateOnCount)
+		if (nb == FIND_INVALID_REGULAR_EXPRESSION)
+			break;
+
+		nbTotal += nb;
+
+		if (progressUi.due())
 		{
-			updateOnCount += filesPerPercent;
-			progress.setPercent(int32_t((i * 100) / filesCount), fileNames.at(i).c_str(), nbTotal);
-		}
-		else
-		{
-			progress.setInfo(fileNames.at(i).c_str(), nbTotal);
+			progress.setPercent(int32_t((i * 100) / filesCount), filePath, nbTotal);
+			progressUi.noteUpdated();
 		}
 	}
 	progress.close();
@@ -2161,6 +2257,7 @@ bool Notepad_plus::findInFinderFiles(FindersInfo *findInFolderInfo)
 	findInFolderInfo->_pDestFinder->finishFilesSearch(nbTotal, int(filesCount), !searchedInSelection, &(findInFolderInfo->_findOption));
 
 	_invisibleEditView.execute(SCI_SETDOCPOINTER, 0, oldDoc);
+	MainFileManager.releaseSearchDocument(scratchDoc);
 	_pEditView = pOldView;
 
 	return true;
@@ -2168,7 +2265,7 @@ bool Notepad_plus::findInFinderFiles(FindersInfo *findInFolderInfo)
 
 bool Notepad_plus::findInFiles()
 {
-	std::vector<wstring> fileNames;
+	std::vector<SearchCandidate> fileNames;
 	if (! createFilelistForFiles(fileNames))
 		return false;
 
@@ -2177,14 +2274,19 @@ bool Notepad_plus::findInFiles()
 
 bool Notepad_plus::findInProjects()
 {
-	vector<wstring> fileNames;
-	if (! createFilelistForProjects(fileNames))
+	vector<wstring> projectFiles;
+	if (! createFilelistForProjects(projectFiles))
 		return false;
+
+	vector<SearchCandidate> fileNames;
+	fileNames.reserve(projectFiles.size());
+	for (auto&& path : projectFiles)
+		fileNames.push_back(SearchCandidate{ std::move(path), -1 });
 
 	return findInFilelist(fileNames);
 }
 
-bool Notepad_plus::findInFilelist(std::vector<wstring> & fileNames)
+bool Notepad_plus::findInFilelist(std::vector<SearchCandidate> & fileNames)
 {
 	int nbTotal = 0;
 	ScintillaEditView *pOldView = _pEditView;
@@ -2196,13 +2298,9 @@ bool Notepad_plus::findInFilelist(std::vector<wstring> & fileNames)
 	Progress progress(_pPublicInterface->getHinst());
 
 	size_t filesCount = fileNames.size();
-	size_t filesPerPercent = 1;
 
 	if (filesCount > 1)
 	{
-		if (filesCount >= 200)
-			filesPerPercent = filesCount / 100;
-
 		wstring msg = _nativeLangSpeaker.getLocalizedStrFromID("find-in-files-progress-title", L"Find In Files progress...");
 		progress.open(_findReplaceDlg.getHSelf(), msg.c_str());
 	}
@@ -2213,19 +2311,16 @@ bool Notepad_plus::findInFilelist(std::vector<wstring> & fileNames)
 	NppParameters& nppParam = NppParameters::getInstance();
 	const NppGUI& nppGui = nppParam.getNppGUI();
 
-	for (size_t i = 0, updateOnCount = filesPerPercent; i < filesCount; ++i)
+	Document scratchDoc = MainFileManager.createSearchDocument();
+	MatchedFileNameProgress progressUi(progress);
+
+	for (size_t i = 0; i < filesCount; ++i)
 	{
 		if (progress.isCancelled()) break;
 
-		bool closeBuf = false;
+		const wchar_t* filePath = fileNames.at(i)._path.c_str();
 
-		BufferID id = nppGui._fif_ignoreunsavedChangesInOpenedFiles ? BUFFER_INVALID : MainFileManager.getBufferFromName(fileNames.at(i).c_str());
-
-		if (id == BUFFER_INVALID)
-		{
-			id = MainFileManager.loadFile(fileNames.at(i).c_str());
-			closeBuf = true;
-		}
+		BufferID id = nppGui._fif_ignoreunsavedChangesInOpenedFiles ? BUFFER_INVALID : MainFileManager.getBufferFromName(filePath);
 
 		if (id != BUFFER_INVALID)
 		{
@@ -2235,7 +2330,7 @@ bool Notepad_plus::findInFilelist(std::vector<wstring> & fileNames)
 			setCodePageForInvisibleView(pBuf);
 
 			FindersInfo findersInfo;
-			findersInfo._pFileName = fileNames.at(i).c_str();
+			findersInfo._pFileName = filePath;
 
 			int nb = _findReplaceDlg.processAll(ProcessFindAll, FindReplaceDlg::_env, isEntireDoc, &findersInfo);
 
@@ -2246,18 +2341,37 @@ bool Notepad_plus::findInFilelist(std::vector<wstring> & fileNames)
 			}
 
 			nbTotal += nb;
+		}
+		else if (scratchDoc)
+		{
+			if (_invisibleEditView.execute(SCI_GETDOCPOINTER) != scratchDoc)
+				_invisibleEditView.execute(SCI_SETDOCPOINTER, 0, scratchDoc);
 
-			if (closeBuf)
-				MainFileManager.closeBuffer(id, _pEditView);
+			SearchLoadResult loaded = MainFileManager.loadFileContentForSearch({ scratchDoc, filePath, fileNames.at(i)._size, &_invisibleEditView });
+			if (loaded._ok)
+			{
+				// New documents start at code page 0; a reused doc may still have the previous file's code page
+				_invisibleEditView.execute(SCI_SETCODEPAGE, 0);
+				setCodePageForInvisibleView(loaded._unicodeMode);
+
+				FindersInfo findersInfo;
+				findersInfo._pFileName = filePath;
+
+				int nb = _findReplaceDlg.processAll(ProcessFindAll, FindReplaceDlg::_env, isEntireDoc, &findersInfo);
+
+				if (nb == FIND_INVALID_REGULAR_EXPRESSION)
+				{
+					hasInvalidRegExpr = true;
+					break;
+				}
+
+				nbTotal += nb;
+			}
 		}
-		if (i == updateOnCount)
+		if (progressUi.due())
 		{
-			updateOnCount += filesPerPercent;
-			progress.setPercent(int32_t((i * 100) / filesCount), fileNames.at(i).c_str(), nbTotal);
-		}
-		else
-		{
-			progress.setInfo(fileNames.at(i).c_str(), nbTotal);
+			progress.setPercent(int32_t((i * 100) / filesCount), filePath, nbTotal);
+			progressUi.noteUpdated();
 		}
 	}
 
@@ -2266,6 +2380,7 @@ bool Notepad_plus::findInFilelist(std::vector<wstring> & fileNames)
 	_findReplaceDlg.finishFilesSearch(nbTotal, int(filesCount), isEntireDoc);
 
 	_invisibleEditView.execute(SCI_SETDOCPOINTER, 0, oldDoc);
+	MainFileManager.releaseSearchDocument(scratchDoc);
 	_pEditView = pOldView;
 
 	_findReplaceDlg.putFindResult(nbTotal);
@@ -2772,41 +2887,58 @@ void Notepad_plus::setupColorSampleBitmapsOnMainMenuItems()
 		{ IDM_SEARCH_GONEXTMARKER_DEF, SCE_UNIVERSAL_FOUND_STYLE, { IDM_SEARCH_GOPREVMARKER_DEF, IDM_SEARCH_MARKEDTOCLIP } }
 	};
 
+	auto getColorBitmap = [this](COLORREF color) -> HBITMAP
+	{
+		if (auto it = _menuItemClrBitmaps.find(color);
+			it != _menuItemClrBitmaps.end())
+		{
+			return it->second;
+		}
+
+		HBITMAP hBitmap = generateSolidColourMenuItemIcon(color);
+		if (hBitmap != nullptr)
+		{
+			_menuItemClrBitmaps.emplace(color, hBitmap);
+		}
+
+		return hBitmap;
+	};
+
+
 	NppParameters& nppParam = NppParameters::getInstance();
 	StyleArray& styleArray = nppParam.getMiscStylerArray();
 
 	for (size_t j = 0; j < sizeof(bitmapOnStyleMenuItemsInfo) / sizeof(bitmapOnStyleMenuItemsInfo[0]); ++j)
 	{
 		const Style * pStyle = styleArray.findByID(bitmapOnStyleMenuItemsInfo[j].styleIndic);
-		if (pStyle)
+		if (pStyle == nullptr)
 		{
-			HBITMAP hNewBitmap = generateSolidColourMenuItemIcon(pStyle->_bgColor);
-			if (hNewBitmap)
+			continue;
+		}
+
+		HBITMAP hBitmap = getColorBitmap(pStyle->_bgColor);
+		if (hBitmap == nullptr)
+		{
+			continue;
+		}
+
+		if (::SetMenuItemBitmaps(_mainMenuHandle, bitmapOnStyleMenuItemsInfo[j].firstOfThisColorMenuId, MF_BYCOMMAND, hBitmap, hBitmap) == TRUE)
+		{
+			for (int relatedMenuId : bitmapOnStyleMenuItemsInfo[j].sameColorMenuIds)
 			{
-				if (!::SetMenuItemBitmaps(_mainMenuHandle, bitmapOnStyleMenuItemsInfo[j].firstOfThisColorMenuId, MF_BYCOMMAND, hNewBitmap, hNewBitmap))
-				{
-					::DeleteObject(hNewBitmap);
-				}
-				else
-				{
-					for (int relatedMenuId : bitmapOnStyleMenuItemsInfo[j].sameColorMenuIds)
-					{
-						::SetMenuItemBitmaps(_mainMenuHandle, relatedMenuId, MF_BYCOMMAND, hNewBitmap, NULL);
-					}
-				}
+				::SetMenuItemBitmaps(_mainMenuHandle, relatedMenuId, MF_BYCOMMAND, hBitmap, nullptr);
 			}
 		}
 	}
 
-	// Adds tab colour icons
+	// Adds tab color icons
 	for (int i = 0; i < TAB_COLORS_COUNT; ++i)
 	{
-		COLORREF colour = nppParam.getIndividualTabColor(i, NppDarkMode::isEnabled(), true);
-		HBITMAP hBitmap = generateSolidColourMenuItemIcon(colour);
-		if (hBitmap)
+		const COLORREF color = nppParam.getIndividualTabColor(i, NppDarkMode::isEnabled(), true);
+		if (HBITMAP hBitmap = getColorBitmap(color);
+			hBitmap != nullptr)
 		{
-			if (!::SetMenuItemBitmaps(_mainMenuHandle, IDM_VIEW_TAB_COLOUR_1 + i, MF_BYCOMMAND, hBitmap, hBitmap))
-				::DeleteObject(hBitmap);
+			::SetMenuItemBitmaps(_mainMenuHandle, IDM_VIEW_TAB_COLOUR_1 + i, MF_BYCOMMAND, hBitmap, hBitmap);
 		}
 	}
 }
@@ -2814,7 +2946,7 @@ void Notepad_plus::setupColorSampleBitmapsOnMainMenuItems()
 // doCheck searches for the menu item matching the provided id across the main menu and all of its submenus,
 // once the target id is found, it ensures that item is checked, and all other menu items at that same level are automatically unchecked.
 // If id is -1, then all the menu items are unchecked.
-bool doCheck(HMENU mainHandle, int id)
+static bool doCheck(HMENU mainHandle, int id)
 {
 	MENUITEMINFO mii{};
 	mii.cbSize = sizeof(MENUITEMINFO);
@@ -5051,20 +5183,8 @@ void Notepad_plus::docGotoAnotherEditView(FileTransferMode mode)
 	{
 		if (_pDocTab->nbItem() == 1)
 		{
-			ScintillaEditView *pOtherView = NULL;
-			if (_pEditView == &_mainEditView)
-			{
-				pOtherView = &_subEditView;
-			}
-			else if (_pEditView == &_subEditView)
-			{
-				pOtherView = &_mainEditView;
-			}
-			else
-				return;
-
-			if (!pOtherView->isVisible())
-				return;
+			ScintillaEditView* pOtherView = getInactiveScintView();
+			if (!pOtherView->isVisible()) return;
 		}
 	}
 
@@ -6959,7 +7079,7 @@ void Notepad_plus::notifyBufferActivated(BufferID bufid, int view)
 	}
 
 	const NppGUI& nppGui = NppParameters::getInstance().getNppGUI();
-	bool isCurrBuffDetection = (nppGui._fileAutoDetection & cdEnabledNew) ? true : false;
+	bool isCurrBuffDetection = (nppGui._fileAutoDetection & cdEnabled4CurrentFile) ? true : false;
 	bool reload = buf->getNeedReload();
 	if (!reload && isCurrBuffDetection)
 	{
@@ -6973,6 +7093,10 @@ void Notepad_plus::notifyBufferActivated(BufferID bufid, int view)
 	// check if possible IncrementalSearch does not need reset
 	if (_incrementFindDlg.isCreated() && _incrementFindDlg.isVisible())
 		_incrementFindDlg.reInitCount();
+
+	// the highlighting of the matches of the Find dialog follows the current document
+	if (_findReplaceDlg.isCreated())
+		_findReplaceDlg.updateMatchHighlighting();
 }
 
 std::vector<wstring> Notepad_plus::loadCommandlineParams(const wchar_t * commandLine, const CmdLineParamsDTO * pCmdParams)

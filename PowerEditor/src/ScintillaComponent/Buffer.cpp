@@ -36,6 +36,12 @@
 #include <string>
 #include <vector>
 
+#include <sddl.h>
+#include <aclapi.h>
+#pragma comment(lib, "advapi32.lib")
+#include <objbase.h>
+#pragma comment(lib, "ole32.lib")
+
 #include <ILexer.h>
 #include <Lexilla.h>
 #include <Scintilla.h>
@@ -853,6 +859,17 @@ void FileManager::checkFilesystemChanges(bool bCheckOnlyCurrentBuffer)
 	{
 		Buffer* buffer = _pNotepadPlus->getCurrentBuffer();
 		buffer->checkFileState();
+
+		// If the 2nd view is visible, check for current file modification in the 2nd view as well
+		if (_pNotepadPlus->viewVisible(_pNotepadPlus->otherView()))
+		{
+			ScintillaEditView* pOtherView = _pNotepadPlus->getInactiveScintView();
+
+			Buffer* bufOnOtherView = pOtherView->getCurrentBuffer();
+			bool reload = bufOnOtherView->getNeedReload();
+			if (!reload)
+				bufOnOtherView->checkFileState();
+		}
 	}
 	else
 	{
@@ -1130,25 +1147,11 @@ bool FileManager::reloadBuffer(BufferID id)
 }
 
 
-void FileManager::setLoadedBufferEncodingAndEol(Buffer* buf, const Utf8_16_Read& UnicodeConvertor, int encoding, EolType bkformat)
+void FileManager::setLoadedBufferEncodingAndEol(Buffer* buf, const Utf8_16_Read& unicodeConvertor, int encoding, EolType bkformat)
 {
 	int encoding2Set = encoding;
-	UniMode unimode2Set = UnicodeConvertor.getEncoding();
-
-	if (encoding2Set == -1)
-	{
-		NppParameters& nppParamInst = NppParameters::getInstance();
-		const NewDocDefaultSettings & ndds = (nppParamInst.getNppGUI()).getNewDocDefaultSettings();
-		
-		if (unimode2Set == uni7Bit)
-			unimode2Set = (ndds._openAnsiAsUtf8) ? uniUTF8_NoBOM : uni8Bit;
-	}
-	else
-	{
-		// Test if encoding is set to UTF8 w/o BOM (usually for utf8 indicator of xml or html)
-		encoding2Set = ((encoding2Set == SC_CP_UTF8) ? -1 : encoding2Set);
-		unimode2Set = uniUTF8_NoBOM;
-	}
+	UniMode unimode2Set = unicodeConvertor.getEncoding();
+	resolveLoadedEncoding(encoding2Set, unimode2Set);
 
 	buf->setEncoding(encoding2Set);
 	buf->setUnicodeMode(unimode2Set);
@@ -1157,6 +1160,24 @@ void FileManager::setLoadedBufferEncodingAndEol(Buffer* buf, const Utf8_16_Read&
 	// Since the buffer will be reloaded from the disk, EOL might have been changed
 	if (bkformat != EolType::unknown)
 		buf->setEolFormat(bkformat);
+}
+
+void FileManager::resolveLoadedEncoding(int& encodingOut, UniMode& unicodeModeOut) const
+{
+	if (encodingOut == -1)
+	{
+		NppParameters& nppParamInst = NppParameters::getInstance();
+		const NewDocDefaultSettings & ndds = (nppParamInst.getNppGUI()).getNewDocDefaultSettings();
+
+		if (unicodeModeOut == uni7Bit)
+			unicodeModeOut = (ndds._openAnsiAsUtf8) ? uniUTF8_NoBOM : uni8Bit;
+	}
+	else
+	{
+		// Test if encoding is set to UTF8 w/o BOM (usually for utf8 indicator of xml or html)
+		encodingOut = ((encodingOut == SC_CP_UTF8) ? -1 : encodingOut);
+		unicodeModeOut = uniUTF8_NoBOM;
+	}
 }
 
 
@@ -1433,6 +1454,96 @@ bool FileManager::deleteBufferBackup(BufferID id)
 	return result;
 }
 
+static std::string encodeForUacSave(const char* buf, size_t len, UniMode mode, int encoding)
+{
+	std::string out;
+
+	if (encoding != -1) // code page conversion, same loop as in the normal path
+	{
+		WcharMbcsConvertor& wmc = WcharMbcsConvertor::getInstance();
+		size_t grab = 0;
+		for (size_t i = 0; i < len; i += grab)
+		{
+			grab = (std::min)(len - i, static_cast<size_t>(blockSize));
+			int newDataLen = 0, incomplete = 0;
+			const char* d = wmc.encode(SC_CP_UTF8, encoding, buf + i, static_cast<int>(grab), &newDataLen, &incomplete);
+			grab -= incomplete;
+			out.append(d, newDataLen);
+		}
+		return out;
+	}
+
+	switch (mode)
+	{
+		case uniUTF8:
+			out.assign("\xEF\xBB\xBF", 3);
+			out.append(buf, len);
+			break;
+
+		case uni16LE: case uni16BE: case uni16LE_NoBOM: case uni16BE_NoBOM:
+		{
+			const bool bigEndian = (mode == uni16BE || mode == uni16BE_NoBOM);
+			const bool withBom = (mode == uni16LE || mode == uni16BE);
+
+			std::wstring w;
+			if (len > 0)
+			{
+				int n = ::MultiByteToWideChar(CP_UTF8, 0, buf, static_cast<int>(len), nullptr, 0);
+				w.resize(n);
+				::MultiByteToWideChar(CP_UTF8, 0, buf, static_cast<int>(len), w.data(), n);
+			}
+
+			out.reserve(w.size() * 2 + 2);
+			if (withBom) { out.push_back(bigEndian ? '\xFE' : '\xFF'); out.push_back(bigEndian ? '\xFF' : '\xFE'); }
+			for (wchar_t c : w)
+			{
+				const char lo = static_cast<char>(c & 0xFF), hi = static_cast<char>((c >> 8) & 0xFF);
+				out.push_back(bigEndian ? hi : lo);
+				out.push_back(bigEndian ? lo : hi);
+			}
+			break;
+		}
+
+		default: // uni8Bit, uni7Bit, uniUTF8_NoBOM (already mapped to uni8Bit above): raw copy
+			out.assign(buf, len);
+			break;
+	}
+	return out;
+}
+
+static std::wstring CreateGuidString()
+{
+	GUID guid{};
+	if (FAILED(::CoCreateGuid(&guid)))
+		return L"";
+
+	wchar_t guidString[40]{};
+	if (!::StringFromGUID2(guid, guidString, ARRAYSIZE(guidString)))
+		return L"";
+
+	return guidString;
+}
+
+static bool CreateMappingSecurityAttributes(SECURITY_ATTRIBUTES& sa, PSECURITY_DESCRIPTOR& pSD)
+{
+	// OW ... OWNER RIGHTS (removes the implicit WRITE_DAC of the owner)
+	// BA ... BUILTIN\Administrators
+	// 0x0004 ... SECTION_MAP_READ
+	LPCWSTR sddl =
+		L"D:P"
+		L"(A;;0x0004;;;OW)"
+		L"(A;;0x0004;;;BA)";
+
+	if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &pSD, nullptr))
+		return false;
+
+	sa.nLength = sizeof(sa);
+	sa.lpSecurityDescriptor = pSD;
+	sa.bInheritHandle = FALSE;
+	return true;
+}
+
+
 std::mutex save_mutex;
 
 SavingStatus FileManager::saveBuffer(BufferID id, const wchar_t* filename, bool isCopy)
@@ -1506,91 +1617,175 @@ SavingStatus FileManager::saveBuffer(BufferID id, const wchar_t* filename, bool 
 
 	int encoding = buffer->getEncoding();
 
-	wstring strTempFile = L"";
-	if (!UnicodeConvertor.openFile(fullpath))
-	{
-		if (NppParameters::getInstance().isEndSessionCritical())
-			return SavingStatus::SaveOpenFailed; // cannot continue to the UAC-prompt at the Windows logoff/reboot/shutdown time
-
-		if (UnicodeConvertor.getLastFileErrorState() != ERROR_ACCESS_DENIED)
-			return SavingStatus::SaveOpenFailed; // cannot be solved by the UAC-prompt
-
-		// ERROR_ACCESS_DENIED, swap to temporary file copy for the UAC elevation way
-
-		wchar_t wszBuf[MAX_PATH + 1]{};
-		if (::GetTempPath(MAX_PATH, wszBuf) == 0)
-			return SavingStatus::SaveOpenFailed; // cannot continue
-
-		strTempFile = wszBuf;
-		strTempFile += L"npp-" + std::to_wstring(GetUnixSysTimeInMilliseconds()) + L".tmp"; // make unique temporary filename
-		if (!UnicodeConvertor.openFile(strTempFile.c_str()))
-			return SavingStatus::SaveOpenFailed; // cannot continue, weird
-	}
-
 	_pscratchTilla->execute(SCI_SETDOCPOINTER, 0, buffer->_doc);	//generate new document
 
 	size_t lengthDoc = _pscratchTilla->getCurrentDocLen();
 	char* buf = (char*)_pscratchTilla->execute(SCI_GETCHARACTERPOINTER);	//to get characters directly from Scintilla buffer
+
+	std::string fileContentSaveUAC;
+	bool uacSaveMode = false;
+	if (!UnicodeConvertor.openFile(fullpath))
+	{
+		if (NppParameters::getInstance().isEndSessionCritical())
+		{
+			_pscratchTilla->execute(SCI_SETDOCPOINTER, 0, _scratchDocDefault);
+			return SavingStatus::SaveOpenFailed; // cannot continue to the UAC-prompt at the Windows logoff/reboot/shutdown time
+		}
+
+		if (UnicodeConvertor.getLastFileErrorState() != ERROR_ACCESS_DENIED)
+		{
+			_pscratchTilla->execute(SCI_SETDOCPOINTER, 0, _scratchDocDefault);
+			return SavingStatus::SaveOpenFailed; // cannot be solved by the UAC-prompt
+		}
+
+		// ERROR_ACCESS_DENIED, get file content from Scintilla view for the UAC elevation way
+		fileContentSaveUAC = encodeForUacSave(buf, lengthDoc, mode, encoding);
+		uacSaveMode = true;
+	}
+
 	bool isWrittenSuccessful = false;
 
-	if (encoding == -1) //no special encoding; can be handled directly by Utf8_16_Write
+	if (!uacSaveMode)
 	{
-		isWrittenSuccessful = UnicodeConvertor.writeFile(buf, lengthDoc);
-		if (lengthDoc == 0)
-			isWrittenSuccessful = true;
-	}
-	else
-	{
-		if (lengthDoc == 0)
+		if (encoding == -1) //no special encoding; can be handled directly by Utf8_16_Write
 		{
-			isWrittenSuccessful = UnicodeConvertor.writeFile(buf, 0);
+			isWrittenSuccessful = UnicodeConvertor.writeFile(buf, lengthDoc);
+			if (lengthDoc == 0)
+				isWrittenSuccessful = true;
 		}
 		else
 		{
-			WcharMbcsConvertor& wmc = WcharMbcsConvertor::getInstance();
-			size_t grabSize = 0;
-			for (size_t i = 0; i < lengthDoc; i += grabSize)
+			if (lengthDoc == 0)
 			{
-				grabSize = lengthDoc - i;
-				if (grabSize > blockSize)
-					grabSize = blockSize;
+				isWrittenSuccessful = UnicodeConvertor.writeFile(buf, 0);
+			}
+			else
+			{
+				WcharMbcsConvertor& wmc = WcharMbcsConvertor::getInstance();
+				size_t grabSize = 0;
+				for (size_t i = 0; i < lengthDoc; i += grabSize)
+				{
+					grabSize = lengthDoc - i;
+					if (grabSize > blockSize)
+						grabSize = blockSize;
 
-				int newDataLen = 0;
-				int incompleteMultibyteChar = 0;
-				const char* newData = wmc.encode(SC_CP_UTF8, encoding, buf + i, static_cast<int>(grabSize), &newDataLen, &incompleteMultibyteChar);
-				grabSize -= incompleteMultibyteChar;
-				isWrittenSuccessful = UnicodeConvertor.writeFile(newData, newDataLen);
+					int newDataLen = 0;
+					int incompleteMultibyteChar = 0;
+					const char* newData = wmc.encode(SC_CP_UTF8, encoding, buf + i, static_cast<int>(grabSize), &newDataLen, &incompleteMultibyteChar);
+					grabSize -= incompleteMultibyteChar;
+					isWrittenSuccessful = UnicodeConvertor.writeFile(newData, newDataLen);
+				}
 			}
 		}
 	}
-
 	UnicodeConvertor.closeFile();
 
-	if (isHiddenOrSys && strTempFile.empty())
+	if (isHiddenOrSys && !uacSaveMode)
 		::SetFileAttributes(fullpath, attributes.dwFileAttributes);
 
 	// Error, we didn't write the entire document to disk.
-	if (!isWrittenSuccessful)
+	if (!uacSaveMode && !isWrittenSuccessful)
 	{
 		_pscratchTilla->execute(SCI_SETDOCPOINTER, 0, _scratchDocDefault);
-		if (!strTempFile.empty())
-			::DeleteFileW(strTempFile.c_str());
 		return SavingStatus::SaveWritingFailed;
 	}
 
-	if (!strTempFile.empty())
+	if (uacSaveMode)
 	{
-		// elevated saving/overwriting of the original file by the help of the tempfile
-		// (notepad++.exe #UAC-SAVE# temp_file_path dest_file_path)
-		wstring strCmdLineParams = NPP_UAC_SAVE_SIGN;
-		strCmdLineParams += L" \"" + strTempFile + L"\" \"";
+		// Default Windows UAC "runas" uses the same user account with elevated token,
+		// while the possible Administrator Protection (AP) mode uses a separate,
+		// system-managed administrator account, with a different SID and separate user profile.
+		// 
+		// With the possible AP mode active, we cannot assume that the current and elevated processes
+		// will have identical user SIDs. Thus we cannot use OpenProcess WINAPI with PROCESS_DUP_HANDLE
+		// higher access right in AP mode from within the elevated Notepad++ child instance
+		// (it cannot cross the security barrier in that mode).
+		// 
+		// Solution:
+		// - using of a uniquely named filemapping object instead of unnamed (that way we do not have to pass/duplicate HANDLEs)
+		// - using of a read-only DACL (owner and administrators only), set already at the creation (works both for the ordinary UAC elevations and the AP)
+		// - the same notepad++.exe module is still checked from the elevated child as before via OpenProcess, since we can drop the use of the PROCESS_DUP_HANDLE now
+
+		std::wstring onetimeGuid = CreateGuidString();
+		if (onetimeGuid.empty())
+		{
+			_pscratchTilla->execute(SCI_SETDOCPOINTER, 0, _scratchDocDefault);
+			return SavingStatus::SaveOpenFailed;
+		}
+		std::wstring uniqueMappingName = NPP_MAPPING_PREFIX + onetimeGuid;
+
+		SECURITY_ATTRIBUTES sa{};
+		PSECURITY_DESCRIPTOR pSD = nullptr;
+		if (!CreateMappingSecurityAttributes(sa, pSD))
+		{
+			_pscratchTilla->execute(SCI_SETDOCPOINTER, 0, _scratchDocDefault);
+			return SavingStatus::SaveOpenFailed;
+		}
+
+		// set mapSize to at least 1, otherwise CreateFileMappingW will fail with ERROR_FILE_INVALID
+		const size_t mapSize = (std::max)(fileContentSaveUAC.size(), static_cast<size_t>(1));
+
+		HANDLE hMap = ::CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE,
+			static_cast<DWORD>((uint64_t)mapSize >> 32), static_cast<DWORD>(mapSize), uniqueMappingName.c_str());
+
+		const bool alreadyExists = (hMap != NULL) && (::GetLastError() == ERROR_ALREADY_EXISTS);
+
+		::LocalFree(pSD);
+		pSD = nullptr;
+
+		if (!hMap)
+		{
+			_pscratchTilla->execute(SCI_SETDOCPOINTER, 0, _scratchDocDefault);
+			 return SavingStatus::SaveOpenFailed;
+		}
+
+		if (alreadyExists) // somebody else has created an object with that name before us, do not use it
+		{
+			::CloseHandle(hMap);
+			_pscratchTilla->execute(SCI_SETDOCPOINTER, 0, _scratchDocDefault);
+			return SavingStatus::SaveOpenFailed;
+		}
+
+		void* p = ::MapViewOfFile(hMap, FILE_MAP_WRITE, 0, 0, mapSize);
+		if (!p)
+		{
+			_pscratchTilla->execute(SCI_SETDOCPOINTER, 0, _scratchDocDefault);
+			::CloseHandle(hMap);
+			return SavingStatus::SaveOpenFailed;
+		}
+
+		memcpy(p, fileContentSaveUAC.data(), fileContentSaveUAC.size());
+		::UnmapViewOfFile(p);
+		p = nullptr;
+
+
+
+		// from here on, nobody (including a same-user attacker) can obtain write access to the section
+		HANDLE hMapRO = NULL;
+		if (!::DuplicateHandle(::GetCurrentProcess(), hMap, ::GetCurrentProcess(), &hMapRO, FILE_MAP_READ, FALSE, DUPLICATE_CLOSE_SOURCE)) // DUPLICATE_CLOSE_SOURCE: destroy the writable handle hMap
+		{
+			_pscratchTilla->execute(SCI_SETDOCPOINTER, 0, _scratchDocDefault);
+			return SavingStatus::SaveOpenFailed;
+		}
+		hMap = NULL;
+
+		// elevated saving/overwriting of the original file by the help of Memory Mapped File and UAC prompt
+		// (notepad++.exe #UAC-SAVE# dest_file_path mapHandle fileContent2SaveLength)
+		std::wstring strCmdLineParams = NPP_UAC_SAVE_SIGN;
+		strCmdLineParams += L" \"";
 		strCmdLineParams += fullpath;
-		strCmdLineParams += L"\"";
+		strCmdLineParams += L"\" ";
+		strCmdLineParams += std::to_wstring(fileContentSaveUAC.size()) + L" ";
+		strCmdLineParams += onetimeGuid;
+
 		DWORD dwNppUacOpError = invokeNppUacOp(strCmdLineParams);
+
+		::CloseHandle(hMapRO); // last closed handle released the mapped object memory
+		hMapRO = NULL;
+
 		if (dwNppUacOpError != NO_ERROR)
 		{
 			_pscratchTilla->execute(SCI_SETDOCPOINTER, 0, _scratchDocDefault);
-			::DeleteFileW(strTempFile.c_str()); // ensure no failed op remnant
 			::SetLastError(dwNppUacOpError); // set that as our current thread one for reporting later
 			return SavingStatus::SaveWritingFailed;
 		}
@@ -1700,8 +1895,47 @@ BufferID FileManager::newEmptyDocument()
 
 	Buffer* newBuf = new Buffer(this, _nextBufferID, doc, DOC_UNNAMED, newTitle.c_str(), false);
 
-	const NewDocDefaultSettings& ndds = (nppParams.getNppGUI()).getNewDocDefaultSettings();
-	newBuf->_lang = ndds._lang;
+	NewDocDefaultSettings& ndds = const_cast<NewDocDefaultSettings&>((nppParams.getNppGUI()).getNewDocDefaultSettings());
+
+	if (ndds._lang != L_USER)
+	{
+		newBuf->_lang = ndds._lang;
+	}
+	else // ndds._lang == L_USER
+	{
+		if (ndds._udl.empty())
+		{
+			ndds._lang = L_TEXT;
+			newBuf->_lang = L_TEXT;
+		}
+		else // ndds._lang == L_USER and ndds._udl is not empty
+		{
+			// check if the user-defined language is still present in our settings, if not, we will fallback to L_TEXT
+			bool found = false;
+			for (size_t u = 0; u < static_cast<size_t>(nppParams.getNbUserLang()); u++)
+			{
+				const UserLangContainer* ulc = nppParams.getULCFromIndex(u);
+				const wchar_t* lName = ulc->getName();
+
+				if (ndds._udl == lName)
+				{
+					found = true;
+					break;
+				}
+			}
+
+			if (!found)
+			{
+				ndds._lang = L_TEXT;
+				ndds._udl = L"";
+				newBuf->_lang = L_TEXT;
+			}
+			else
+			{
+				newBuf->setLangType(L_USER, ndds._udl.c_str());
+			}
+		}
+	}
 
 	BufferID id = newBuf;
 	newBuf->_id = id;
@@ -2001,131 +2235,8 @@ bool FileManager::loadFileData(Document doc, int64_t fileSize, const wchar_t * f
 		if ((sciStatus > SC_STATUS_OK) && (sciStatus < SC_STATUS_WARN_START))
 			throw std::runtime_error("Scintilla error");
 
-		size_t lenFile = 0;
-		size_t lenConvert = 0;	//just in case conversion results in 0, but file not empty
-		bool isFirstTime = true;
-		int incompleteMultibyteChar = 0;
-		bool hasBOM = false;
-
-		do
-		{
-			lenFile = fread(data + incompleteMultibyteChar, 1, blockSize - incompleteMultibyteChar, fp) + incompleteMultibyteChar;
-			if (ferror(fp) != 0)
-			{
-				success = false;
-				break;
-			}
-
-			if (lenFile == 0) break;
-
-			if (isFirstTime)
-			{
-				NppParameters& nppParamInst = NppParameters::getInstance();
-				const NppGUI& nppGui = nppParamInst.getNppGUI();
-
-				//
-				// Detect encoding
-				//
-
-				// check if file contain any BOM
-				if (Utf8_16_Read::determineEncodingFromBOM((unsigned char*)data, lenFile) != uni8Bit)
-				{
-					// if file contains any BOM, then encoding will be erased,
-					// and the document will be interpreted as UTF
-					fileFormat._encoding = -1;
-					hasBOM = true;
-				}
-				else if (fileFormat._encoding == -1)
-				{
-					if (nppGui._detectEncoding && !isAutoDetectEncodingDisabled4Loading)
-						fileFormat._encoding = detectCodepage(data, lenFile);
-				}
-
-				//
-				// Detect programming language
-				//
-
-				bool isLargeFile = fileSize >= nppGui._largeFileRestriction._largeFileSizeDefInByte;
-				if (!isLargeFile && fileFormat._language == L_TEXT)
-				{
-					// check the language du fichier
-					fileFormat._language = detectLanguageFromTextBeginning((unsigned char *)data, lenFile);
-				}
-
-				isFirstTime = false;
-			}
-
-
-			if (fileFormat._encoding != -1)
-			{
-				if (fileFormat._encoding == SC_CP_UTF8)
-				{
-					// Pass through UTF-8 (this does not check validity of characters, thus inserting a multi-byte character in two halfs is working)
-					_pscratchTilla->execute(SCI_APPENDTEXT, lenFile, reinterpret_cast<LPARAM>(data));
-				}
-				else
-				{
-					WcharMbcsConvertor& wmc = WcharMbcsConvertor::getInstance();
-					int newDataLen = 0;
-					const char* newData = wmc.encode(fileFormat._encoding, SC_CP_UTF8, data, static_cast<int32_t>(lenFile), &newDataLen, &incompleteMultibyteChar);
-					_pscratchTilla->execute(SCI_APPENDTEXT, newDataLen, reinterpret_cast<LPARAM>(newData));
-				}
-
-				if (format == EolType::unknown)
-					format = getEOLFormatForm(data, lenFile, EolType::unknown);
-			}
-			else // (fileFormat._encoding == -1) => encoding not found yet or BOM found
-			{
-				NppParameters& nppParamInst = NppParameters::getInstance();
-				lenConvert = unicodeConvertor->convert(data, lenFile);
-
-				if (!nppParamInst.isCurrentSystemCodepageUTF8()) // Default mode: all other encodings
-				{
-					_pscratchTilla->execute(SCI_APPENDTEXT, lenConvert, reinterpret_cast<LPARAM>(unicodeConvertor->getNewBuf()));
-					if (format == EolType::unknown)
-						format = getEOLFormatForm(unicodeConvertor->getNewBuf(), unicodeConvertor->getNewSize(), EolType::unknown);
-				}
-				else // "Use Unicode UTF-8 for worldwide language support" option is enabled 
-				{
-					UniMode uniMode = unicodeConvertor->getEncoding();
-
-					if (hasBOM || // uniUTF8, uni16BE, uni16LE
-						uniMode == uni16BE_NoBOM || uniMode == uni16LE_NoBOM || uniMode == uniUTF8_NoBOM || uniMode == uni7Bit)
-					{
-						if (uniMode == uni7Bit)
-							fileFormat._encoding = nppParamInst.currentSystemCodepage();
-
-						_pscratchTilla->execute(SCI_APPENDTEXT, lenConvert, reinterpret_cast<LPARAM>(unicodeConvertor->getNewBuf()));
-
-						if (format == EolType::unknown)
-							format = getEOLFormatForm(unicodeConvertor->getNewBuf(), unicodeConvertor->getNewSize(), EolType::unknown);
-					}
-					else // if (uniMode == uni8Bit)
-					{
-						WcharMbcsConvertor& wmc = WcharMbcsConvertor::getInstance();
-						int newDataLen = 0;
-						fileFormat._encoding = nppParamInst.defaultCodepage();
-
-						const char* newData = wmc.encode(fileFormat._encoding, SC_CP_UTF8, data, static_cast<int32_t>(lenFile), &newDataLen, &incompleteMultibyteChar);
-						_pscratchTilla->execute(SCI_APPENDTEXT, newDataLen, reinterpret_cast<LPARAM>(newData));
-
-						if (format == EolType::unknown)
-							format = getEOLFormatForm(data, lenFile, EolType::unknown);
-					}
-				}
-			}
-
-			sciStatus = static_cast<int>(_pscratchTilla->execute(SCI_GETSTATUS));
-			if ((sciStatus > SC_STATUS_OK) && (sciStatus < SC_STATUS_WARN_START))
-				throw std::runtime_error("Scintilla error");
-
-			if (incompleteMultibyteChar != 0)
-			{
-				// copy bytes to next buffer
-				memcpy(data, data + blockSize - incompleteMultibyteChar, incompleteMultibyteChar);
-			}
-		}
-		while (lenFile > 0);
+		if (!copyFileContentToScintilla(_pscratchTilla, fp, data, fileSize, unicodeConvertor, fileFormat, format, sciStatus, DocumentFillPolicy::forEditing()))
+			success = false;
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER)
 	{
@@ -2201,6 +2312,244 @@ bool FileManager::loadFileData(Document doc, int64_t fileSize, const wchar_t * f
 	_pscratchTilla->execute(SCI_SETDOCPOINTER, 0, _scratchDocDefault);
 
 	return success;
+}
+
+bool FileManager::copyFileContentToScintilla(ScintillaEditView* ingestView, FILE* fp, char* data, int64_t fileSize, Utf8_16_Read* unicodeConvertor, LoadedFileFormat& fileFormat, EolType& format, int& sciStatus, const DocumentFillPolicy& policy)
+{
+	size_t lenFile = 0;
+	size_t lenConvert = 0;	//just in case conversion results in 0, but file not empty
+	bool isFirstTime = true;
+	int incompleteMultibyteChar = 0;
+	bool hasBOM = false;
+
+	do
+	{
+		lenFile = fread(data + incompleteMultibyteChar, 1, blockSize - incompleteMultibyteChar, fp) + incompleteMultibyteChar;
+		if (ferror(fp) != 0)
+		{
+			return false;
+		}
+
+		if (lenFile == 0) break;
+
+		if (isFirstTime)
+		{
+			NppParameters& nppParamInst = NppParameters::getInstance();
+			const NppGUI& nppGui = nppParamInst.getNppGUI();
+
+			//
+			// Detect encoding
+			//
+
+			// check if file contain any BOM
+			if (Utf8_16_Read::determineEncodingFromBOM((unsigned char*)data, lenFile) != uni8Bit)
+			{
+				// if file contains any BOM, then encoding will be erased,
+				// and the document will be interpreted as UTF
+				fileFormat._encoding = -1;
+				hasBOM = true;
+			}
+			else if (fileFormat._encoding == -1)
+			{
+				if (nppGui._detectEncoding && !isAutoDetectEncodingDisabled4Loading)
+					fileFormat._encoding = detectCodepage(data, lenFile);
+			}
+
+			//
+			// Detect programming language
+			//
+
+			bool isLargeFile = fileSize >= nppGui._largeFileRestriction._largeFileSizeDefInByte;
+			if (policy._detectLanguageFromContent && !isLargeFile && fileFormat._language == L_TEXT)
+			{
+				// check the language du fichier
+				fileFormat._language = detectLanguageFromTextBeginning((unsigned char *)data, lenFile);
+			}
+
+			isFirstTime = false;
+		}
+
+
+		if (fileFormat._encoding != -1)
+		{
+			if (fileFormat._encoding == SC_CP_UTF8)
+			{
+				// Pass through UTF-8 (this does not check validity of characters, thus inserting a multi-byte character in two halfs is working)
+				ingestView->execute(SCI_APPENDTEXT, lenFile, reinterpret_cast<LPARAM>(data));
+			}
+			else
+			{
+				WcharMbcsConvertor& wmc = WcharMbcsConvertor::getInstance();
+				int newDataLen = 0;
+				const char* newData = wmc.encode(fileFormat._encoding, SC_CP_UTF8, data, static_cast<int32_t>(lenFile), &newDataLen, &incompleteMultibyteChar);
+				ingestView->execute(SCI_APPENDTEXT, newDataLen, reinterpret_cast<LPARAM>(newData));
+			}
+
+			if (format == EolType::unknown)
+				format = getEOLFormatForm(data, lenFile, EolType::unknown);
+		}
+		else // (fileFormat._encoding == -1) => encoding not found yet or BOM found
+		{
+			NppParameters& nppParamInst = NppParameters::getInstance();
+			lenConvert = unicodeConvertor->convert(data, lenFile);
+
+			if (!nppParamInst.isCurrentSystemCodepageUTF8()) // Default mode: all other encodings
+			{
+				ingestView->execute(SCI_APPENDTEXT, lenConvert, reinterpret_cast<LPARAM>(unicodeConvertor->getNewBuf()));
+				if (format == EolType::unknown)
+					format = getEOLFormatForm(unicodeConvertor->getNewBuf(), unicodeConvertor->getNewSize(), EolType::unknown);
+			}
+			else // "Use Unicode UTF-8 for worldwide language support" option is enabled 
+			{
+				UniMode uniMode = unicodeConvertor->getEncoding();
+
+				if (hasBOM || // uniUTF8, uni16BE, uni16LE
+					uniMode == uni16BE_NoBOM || uniMode == uni16LE_NoBOM || uniMode == uniUTF8_NoBOM || uniMode == uni7Bit)
+				{
+					if (uniMode == uni7Bit)
+						fileFormat._encoding = nppParamInst.currentSystemCodepage();
+
+					ingestView->execute(SCI_APPENDTEXT, lenConvert, reinterpret_cast<LPARAM>(unicodeConvertor->getNewBuf()));
+
+					if (format == EolType::unknown)
+						format = getEOLFormatForm(unicodeConvertor->getNewBuf(), unicodeConvertor->getNewSize(), EolType::unknown);
+				}
+				else // if (uniMode == uni8Bit)
+				{
+					WcharMbcsConvertor& wmc = WcharMbcsConvertor::getInstance();
+					int newDataLen = 0;
+					fileFormat._encoding = nppParamInst.defaultCodepage();
+
+					const char* newData = wmc.encode(fileFormat._encoding, SC_CP_UTF8, data, static_cast<int32_t>(lenFile), &newDataLen, &incompleteMultibyteChar);
+					ingestView->execute(SCI_APPENDTEXT, newDataLen, reinterpret_cast<LPARAM>(newData));
+
+					if (format == EolType::unknown)
+						format = getEOLFormatForm(data, lenFile, EolType::unknown);
+				}
+			}
+		}
+
+		sciStatus = static_cast<int>(ingestView->execute(SCI_GETSTATUS));
+		if ((sciStatus > SC_STATUS_OK) && (sciStatus < SC_STATUS_WARN_START))
+			throw std::runtime_error("Scintilla error");
+
+		if (incompleteMultibyteChar != 0)
+		{
+			// copy bytes to next buffer
+			memcpy(data, data + blockSize - incompleteMultibyteChar, incompleteMultibyteChar);
+		}
+	}
+	while (lenFile > 0);
+
+	return true;
+}
+
+Document FileManager::createSearchDocument()
+{
+	if (!_pscratchTilla)
+		return static_cast<Document>(NULL);
+
+	return static_cast<Document>(_pscratchTilla->execute(SCI_CREATEDOCUMENT, 0,
+		SC_DOCUMENTOPTION_STYLES_NONE | SC_DOCUMENTOPTION_TEXT_LARGE));
+}
+
+void FileManager::releaseSearchDocument(Document doc)
+{
+	if (!_pscratchTilla || !doc)
+		return;
+
+	_pscratchTilla->execute(SCI_RELEASEDOCUMENT, 0, doc);
+}
+
+SearchLoadResult FileManager::loadFileContentForSearch(const SearchFillRequest& request)
+{
+	SearchLoadResult result;
+	if (!request._scratchDoc || !request._path || !request._ingestView)
+		return result;
+
+	ScintillaEditView* ingestView = request._ingestView;
+
+	int64_t fileSize = request._knownSize;
+	if (fileSize < 0)
+	{
+		WIN32_FILE_ATTRIBUTE_DATA attributes{};
+		attributes.dwFileAttributes = INVALID_FILE_ATTRIBUTES;
+		if (!::GetFileAttributesExW(request._path, GetFileExInfoStandard, &attributes)
+			|| (attributes.dwFileAttributes == INVALID_FILE_ATTRIBUTES)
+			|| (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+		{
+			return result;
+		}
+
+		LARGE_INTEGER size{};
+		size.LowPart = attributes.nFileSizeLow;
+		size.HighPart = attributes.nFileSizeHigh;
+		fileSize = size.QuadPart;
+	}
+
+	NppParameters& nppParam = NppParameters::getInstance();
+	if ((fileSize + std::min<int64_t>(1LL << 20, fileSize / 6)) > INT_MAX)
+	{
+		if (nppParam.archType() == IMAGE_FILE_MACHINE_I386)
+			return result;
+	}
+
+	FILE* fp = _wfopen(request._path, L"rb");
+	if (!fp)
+		return result;
+
+	char* data = new char[blockSize + 8]; // +8 for incomplete multibyte char
+
+	Utf8_16_Read unicodeConvertor;
+	LoadedFileFormat loadedFileFormat;
+	loadedFileFormat._encoding = -1;
+	loadedFileFormat._eolFormat = EolType::unknown;
+	loadedFileFormat._language = L_TEXT;
+
+	if (ingestView->execute(SCI_GETDOCPOINTER) != request._scratchDoc)
+		ingestView->execute(SCI_SETDOCPOINTER, 0, request._scratchDoc);
+
+	ingestView->execute(SCI_SETSTATUS, SC_STATUS_OK);
+	if (ingestView->execute(SCI_GETREADONLY) != 0)
+		ingestView->execute(SCI_SETREADONLY, false);
+
+	ingestView->execute(SCI_CLEARALL);
+	ingestView->execute(SCI_SETUNDOCOLLECTION, false);
+
+	bool success = true;
+	EolType format = EolType::unknown;
+	int sciStatus = SC_STATUS_OK;
+
+	ingestView->execute(SCI_ALLOCATE, WPARAM(fileSize));
+	sciStatus = static_cast<int>(ingestView->execute(SCI_GETSTATUS));
+	if ((sciStatus > SC_STATUS_OK) && (sciStatus < SC_STATUS_WARN_START))
+	{
+		success = false;
+	}
+	else
+	{
+		try
+		{
+			if (!copyFileContentToScintilla(ingestView, fp, data, fileSize, &unicodeConvertor, loadedFileFormat, format, sciStatus, DocumentFillPolicy::forSearching()))
+				success = false;
+		}
+		catch (...)
+		{
+			success = false;
+		}
+	}
+
+	fclose(fp);
+	delete[] data;
+
+	if (!success)
+		return result;
+
+	result._encoding = loadedFileFormat._encoding;
+	result._unicodeMode = unicodeConvertor.getEncoding();
+	resolveLoadedEncoding(result._encoding, result._unicodeMode);
+	result._ok = true;
+	return result;
 }
 
 

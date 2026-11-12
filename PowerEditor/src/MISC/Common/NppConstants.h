@@ -52,6 +52,8 @@ inline constexpr int NPP_CP_BIG5 = 950;
 #define NPP_UAC_MOVEFILE_SIGN L"#UAC-MOVEFILE#"
 #define NPP_UAC_CREATEEMPTYFILE_SIGN L"#UAC-CREATEEMPTYFILE#"
 
+#define NPP_MAPPING_PREFIX L"Local\\NotepadPlusPlus_Mapping_"
+
 enum class SubclassID : unsigned int
 {
 	darkMode = 42,
@@ -190,11 +192,11 @@ enum UniMode
 
 enum ChangeDetect
 {
-	cdDisabled      = 0x00,
-	cdEnabledOld    = 0x01,
-	cdEnabledNew    = 0x02,
-	cdAutoUpdate    = 0x04,
-	cdGo2end        = 0x08
+	cdDisabled               = 0x00,
+	cdEnabled4AllFiles       = 0x01,
+	cdEnabled4CurrentFile    = 0x02,
+	cdAutoUpdate             = 0x04,
+	cdGo2end                 = 0x08
 };
 
 enum BackupFeature

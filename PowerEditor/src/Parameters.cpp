@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,14 +39,18 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include <SciLexer.h>
 #include <Scintilla.h>
 
+#include "AboutDlg.h"
 #include "Common.h"
 #include "ContextMenu.h"
+#include "Notepad_plus.h"
 #include "Notepad_plus_Window.h"
 #include "Notepad_plus_msgs.h"
 #include "NppConstants.h"
@@ -1582,7 +1587,14 @@ bool NppParameters::load()
 	{
 		auto r = addUserDefineLangsFromXmlTree(_pXmlUserLangDoc._doc);
 		if (r.second - r.first > 0)
+		{
 			_pXmlUserLangsDoc.emplace_back(_pXmlUserLangDoc._doc, _pXmlUserLangDoc._path, false, true, r);
+		}
+		else
+		{
+			delete _pXmlUserLangDoc._doc;
+			_pXmlUserLangDoc._doc = nullptr;
+		}
 	}
 
 	for (const auto& i : udlFiles)
@@ -2121,7 +2133,12 @@ void NppParameters::setFontList(HWND hWnd)
 	lf.lfFaceName[0]='\0';
 	lf.lfPitchAndFamily = 0;
 	HDC hDC = ::GetDC(hWnd);
-	::EnumFontFamiliesEx(hDC, &lf, EnumFontFamExProc, reinterpret_cast<LPARAM>(&_fontlist), 0);
+	if (hDC)
+	{
+		::EnumFontFamiliesEx(hDC, &lf, EnumFontFamExProc, reinterpret_cast<LPARAM>(&_fontlist), 0);
+		::ReleaseDC(hWnd, hDC);
+	}
+	_fontlist.push_back(DEFAULT_DLG_FONT);
 }
 
 bool NppParameters::isInFontList(const std::wstring& fontName2Search) const
@@ -3295,7 +3312,7 @@ bool NppParameters::makeDefaultServerWhiteList(bool bSave2File)
 {
 	if (_pXmlServerWhiteListDoc)
 	{
-		_pXmlServerWhiteListDoc->reset();
+		NppXml::reset(_pXmlServerWhiteListDoc);
 	}
 	else
 	{
@@ -3310,9 +3327,7 @@ bool NppParameters::makeDefaultServerWhiteList(bool bSave2File)
 	NppXml::Element childElement = NppXml::createChildElement(root, "NetworkPathsAlwaysAction");
 	NppXml::setAttribute(childElement, "value", "?"); // default (networkPathAlwaysAsk)
 
-	return bSave2File ?
-		_pXmlServerWhiteListDoc->save_file(_serverWhiteListPath.c_str(), "    ", pugi::format_indent | pugi::format_no_declaration | pugi::format_save_file_text) 
-		: true;
+	return bSave2File ? NppXml::saveServerWhiteList(_pXmlServerWhiteListDoc, _serverWhiteListPath) : true;
 }
 
 bool NppParameters::addServerToWhiteList(const char* netpath, bool bCaseSensitive)
@@ -3354,9 +3369,9 @@ bool NppParameters::addServerToWhiteList(const char* netpath, bool bCaseSensitiv
 
 	// add new record
 	NppXml::Element elementServerAllowed = NppXml::createChildElement(root, "ServerAllowed");
-	NppXml::setAttribute(elementServerAllowed, "name", netpathServerName.c_str());
+	NppXml::setAttribute(elementServerAllowed, "name", netpathServerName);
 
-	return _pXmlServerWhiteListDoc->save_file(_serverWhiteListPath.c_str(), "    ", pugi::format_indent | pugi::format_no_declaration | pugi::format_save_file_text);
+	return NppXml::saveServerWhiteList(_pXmlServerWhiteListDoc, _serverWhiteListPath);
 }
 
 bool NppParameters::setNetworkPathAlwaysActionInServerWhitelist(NetworkPathAlwaysAction mode)
@@ -3391,7 +3406,7 @@ bool NppParameters::setNetworkPathAlwaysActionInServerWhitelist(NetworkPathAlway
 
 			_networkPathAlwaysAction = mode;
 
-			return _pXmlServerWhiteListDoc->save_file(_serverWhiteListPath.c_str(), "    ", pugi::format_indent | pugi::format_no_declaration | pugi::format_save_file_text);
+			return NppXml::saveServerWhiteList(_pXmlServerWhiteListDoc, _serverWhiteListPath);
 		}
 	}
 
@@ -3478,14 +3493,14 @@ bool NppParameters::getSessionFromXmlTree(const NppXml::Document& pSessionDoc, S
 									// otherwise any subsequent indirect Notepad++ app launching (e.g. via the NppShell context menu)
 									// causes this getSessionFromXmlTree will check old out-of-date session.xml content
 									bNeedsSessionXmlFileUpdateAfter = true;
-									viewRoots[k].remove_child(childNode);
+									NppXml::deleteChild(viewRoots[k], childNode);
 									continue;
 								}
 							}
 							else if (_networkPathAlwaysAction == networkPathAlwaysSkip)
 							{
 								bNeedsSessionXmlFileUpdateAfter = true;
-								viewRoots[k].remove_child(childNode);
+								NppXml::deleteChild(viewRoots[k], childNode);
 								continue;
 							}
 							else if (_networkPathAlwaysAction == networkPathAlwaysLoad)
@@ -3540,14 +3555,14 @@ bool NppParameters::getSessionFromXmlTree(const NppXml::Document& pSessionDoc, S
 								if (buttonID == IDCANCEL || buttonID == IDNO) // Skip once or Always skip
 								{
 									bNeedsSessionXmlFileUpdateAfter = true;
-									viewRoots[k].remove_child(childNode);
+									NppXml::deleteChild(viewRoots[k], childNode);
 									continue;
 								}
 							}
 							else if (_networkPathAlwaysAction == networkPathAlwaysSkip)
 							{
 								bNeedsSessionXmlFileUpdateAfter = true;
-								viewRoots[k].remove_child(childNode);
+								NppXml::deleteChild(viewRoots[k], childNode);
 								continue;
 							}
 							else if (_networkPathAlwaysAction == networkPathAlwaysLoad)
@@ -3569,24 +3584,24 @@ bool NppParameters::getSessionFromXmlTree(const NppXml::Document& pSessionDoc, S
 					}
 					else if (!wstrBackupFilePath.empty())
 					{
-						wchar_t* fn = ::PathFindFileNameW(wstrBackupFilePath.c_str());
-						::StringCchCopyW(normalizedBackupFilePath, MAX_PATH, fn);
+						const wchar_t* fn = ::PathFindFileNameW(wstrBackupFilePath.c_str());
+						static_cast<void>(::StringCchCopyW(normalizedBackupFilePath, MAX_PATH, fn));
 					}
 
 					std::wstring currentBackupFilePath = NppParameters::getInstance().getUserPath() + L"\\backup\\";
 
 					wchar_t normalizedBackupDir[MAX_PATH]{};
 					if (::GetFullPathNameW(currentBackupFilePath.c_str(), MAX_PATH, normalizedBackupDir, NULL) == 0)
-						::StringCchCopyW(normalizedBackupDir, MAX_PATH, currentBackupFilePath.c_str());
+						static_cast<void>(::StringCchCopyW(normalizedBackupDir, MAX_PATH, currentBackupFilePath.c_str()));
 
 					if (normalizedBackupFilePath[0])
 					{
-						std::wstring backupFilePath = normalizedBackupFilePath;
+						const std::wstring backupFilePathW = normalizedBackupFilePath;
 						bool isConfined = false;
 						size_t normalizedBackupDirLen = wcslen(normalizedBackupDir);
-						if (backupFilePath.size() >= normalizedBackupDirLen)
+						if (backupFilePathW.size() >= normalizedBackupDirLen)
 						{
-							int res = ::CompareStringOrdinal(backupFilePath.c_str(), static_cast<int>(normalizedBackupDirLen), normalizedBackupDir, static_cast<int>(normalizedBackupDirLen), TRUE);
+							int res = ::CompareStringOrdinal(backupFilePathW.c_str(), static_cast<int>(normalizedBackupDirLen), normalizedBackupDir, static_cast<int>(normalizedBackupDirLen), TRUE);
 							isConfined = res == CSTR_EQUAL;
 						}
 
@@ -3597,7 +3612,7 @@ bool NppParameters::getSessionFromXmlTree(const NppXml::Document& pSessionDoc, S
 
 							std::wstring safePath = normalizedBackupDir;
 							safePath += fn;
-							::StringCchCopyW(normalizedBackupFilePath, MAX_PATH, safePath.c_str());
+							static_cast<void>(::StringCchCopyW(normalizedBackupFilePath, MAX_PATH, safePath.c_str()));
 						}
 					}
 
@@ -3686,14 +3701,14 @@ bool NppParameters::getSessionFromXmlTree(const NppXml::Document& pSessionDoc, S
 							if (buttonID == IDCANCEL || buttonID == IDNO) // Skip once or Always skip
 							{
 								bNeedsSessionXmlFileUpdateAfter = true;
-								fileBrowserRoot.remove_child(childNode);
+								NppXml::deleteChild(fileBrowserRoot, childNode);
 								continue;
 							}
 						}
 						else if (_networkPathAlwaysAction == networkPathAlwaysSkip)
 						{
 							bNeedsSessionXmlFileUpdateAfter = true;
-							fileBrowserRoot.remove_child(childNode);
+							NppXml::deleteChild(fileBrowserRoot, childNode);
 							continue;
 						}
 						else if (_networkPathAlwaysAction == networkPathAlwaysLoad)
@@ -3734,7 +3749,7 @@ bool NppParameters::getSessionFromXmlTree(const NppXml::Document& pSessionDoc, S
 	}
 
 	if (bNeedsSessionXmlFileUpdateAfter && !sessionDocFileName.empty())
-		pSessionDoc->save_file(sessionDocFileName.c_str());
+		static_cast<void>(NppXml::saveFile(pSessionDoc, sessionDocFileName));
 
 	return true;
 }
@@ -4016,8 +4031,14 @@ void NppParameters::feedFindHistoryParameters(const NppXml::Element& element)
 	_findHistory._dotMatchesNewline = getBoolAttribute(findHistoryRoot, "dotMatchesNewline");
 	_findHistory._isSearch2ButtonsMode = getBoolAttribute(findHistoryRoot, "isSearch2ButtonsMode");
 	_findHistory._regexBackward4PowerUser = getBoolAttribute(findHistoryRoot, "regexBackward4PowerUser");
+	_findHistory._findDlgHighlightMatches = getBoolAttribute(findHistoryRoot, "findDlgHighlightMatches");
 	_findHistory._isBookmarkLine = getBoolAttribute(findHistoryRoot, "bookmarkLine");
 	_findHistory._isPurge = getBoolAttribute(findHistoryRoot, "purge");
+
+	_findHistory._isIncrementalMatchCase = getBoolAttribute(findHistoryRoot, "incrementalMatchCase", _findHistory._isIncrementalMatchCase);
+	_findHistory._isIncrementalHighlightAll = getBoolAttribute(findHistoryRoot, "incrementalHighlightAll", _findHistory._isIncrementalHighlightAll);
+	_findHistory._isIncrementalCount = getBoolAttribute(findHistoryRoot, "incrementalCount", _findHistory._isIncrementalCount);
+	_findHistory._incrementalSearchBarAtTop = getBoolAttribute(findHistoryRoot, "incrementalSearchBarAtTop", _findHistory._incrementalSearchBarAtTop);
 }
 
 void NppParameters::feedShortcut(const NppXml::Element& element)
@@ -4380,6 +4401,7 @@ std::pair<unsigned char, unsigned char> NppParameters::feedUserLang(const NppXml
 				if (!pStyle)
 					_userLangArray[_nbUserLang - 1]->_styles.addStyler(i, string2wstring(globalMappper().styleNameMapper[i]).c_str());
 			}
+			_userLangArray[_nbUserLang - 1]->_isUnset = false;
 
 		}
 		catch (const std::exception&)
@@ -5854,6 +5876,8 @@ std::wstring NppParameters::getLocPathFromStr(const std::wstring & localizationC
 		return L"kurdish.xml";
 	if (localizationCode == L"ky")
 		return L"kyrgyz.xml";
+	if (localizationCode == L"lo" || localizationCode == L"lo-la")
+		return L"lao.xml";
 	if (localizationCode == L"lv")
 		return L"latvian.xml";
 	if (localizationCode == L"lt")
@@ -5864,6 +5888,8 @@ std::wstring NppParameters::getLocPathFromStr(const std::wstring & localizationC
 		return L"macedonian.xml";
 	if (localizationCode == L"ms")
 		return L"malay.xml";
+	if (localizationCode == L"ml")
+        return L"malayalam.xml";
 	if (localizationCode == L"mr")
 		return L"marathi.xml";
 	if (localizationCode == L"mn")
@@ -6081,6 +6107,12 @@ void NppParameters::feedGUIParameters(const NppXml::Element& element)
 		{
 			_nppGUI._menuBarShow = getBoolChildTextNode(childNode, _nppGUI._menuBarShow, STR_BOOL_SHOWHIDE);
 		}
+		// <GUIConfig name="DialogFont" size="8" fontName="MS Shell Dlg" />
+		else if (std::strcmp(nm, "DialogFont") == 0)
+		{
+			_nppGUI._fontDlgSize = static_cast<WORD>(NppXml::uintAttribute(childNode, "size", _nppGUI._fontDlgSize));
+			_nppGUI._fontDlgName = NppXml::attributeW(childNode, "fontName", "MS Shell Dlg");
+		}
 		// <GUIConfig name="TabBar" dragAndDrop="yes" drawTopBar="yes" drawInactiveTab="yes" reduce="yes" closeButton="yes"
 		// pinButton="yes" showOnlyPinnedButton="no" buttonsOninactiveTabs="no" doubleClick2Close="no"
 		// vertical="no" multiLine="no" hide="no" quitOnEmpty="no" tabCompactLabelLen="0" />
@@ -6147,22 +6179,22 @@ void NppParameters::feedGUIParameters(const NppXml::Element& element)
 				const char* val = NppXml::getValue(n);
 				if (val)
 				{
-					if (std::strcmp(val, "yesOld") == 0)
-						_nppGUI._fileAutoDetection = cdEnabledOld;
+					if (std::strcmp(val, "yesOld") == 0) // Enable auto-detection for all files (old default behavior)
+						_nppGUI._fileAutoDetection = cdEnabled4AllFiles;
 					else if (std::strcmp(val, "autoOld") == 0)
-						_nppGUI._fileAutoDetection = (cdEnabledOld | cdAutoUpdate);
+						_nppGUI._fileAutoDetection = (cdEnabled4AllFiles | cdAutoUpdate);
 					else if (std::strcmp(val, "Update2EndOld") == 0)
-						_nppGUI._fileAutoDetection = (cdEnabledOld | cdGo2end);
+						_nppGUI._fileAutoDetection = (cdEnabled4AllFiles | cdGo2end);
 					else if (std::strcmp(val, "autoUpdate2EndOld") == 0)
-						_nppGUI._fileAutoDetection = (cdEnabledOld | cdAutoUpdate | cdGo2end);
-					else if (std::strcmp(val, "yes") == 0)
-						_nppGUI._fileAutoDetection = cdEnabledNew;
+						_nppGUI._fileAutoDetection = (cdEnabled4AllFiles | cdAutoUpdate | cdGo2end);
+					else if (std::strcmp(val, "yes") == 0) // Enable auto-detection for the current file only (new default behavior)
+						_nppGUI._fileAutoDetection = cdEnabled4CurrentFile;
 					else if (std::strcmp(val, "auto") == 0)
-						_nppGUI._fileAutoDetection = (cdEnabledNew | cdAutoUpdate);
+						_nppGUI._fileAutoDetection = (cdEnabled4CurrentFile | cdAutoUpdate);
 					else if (std::strcmp(val, "Update2End") == 0)
-						_nppGUI._fileAutoDetection = (cdEnabledNew | cdGo2end);
+						_nppGUI._fileAutoDetection = (cdEnabled4CurrentFile | cdGo2end);
 					else if (std::strcmp(val, "autoUpdate2End") == 0)
-						_nppGUI._fileAutoDetection = (cdEnabledNew | cdAutoUpdate | cdGo2end);
+						_nppGUI._fileAutoDetection = (cdEnabled4CurrentFile | cdAutoUpdate | cdGo2end);
 					else //(std::strcmp(val, "no") == 0)
 						_nppGUI._fileAutoDetection = cdDisabled;
 				}
@@ -6534,6 +6566,7 @@ void NppParameters::feedGUIParameters(const NppXml::Element& element)
 			{
 				using enum LangType;
 				_nppGUI._newDocDefaultSettings._lang = static_cast<LangType>(NppXml::intAttribute(childNode, "lang", static_cast<int>(L_TEXT)));
+				_nppGUI._newDocDefaultSettings._udl = NppXml::attributeW(childNode, "udl");
 				_nppGUI._newDocDefaultSettings._codepage = NppXml::intAttribute(childNode, "codepage", _nppGUI._newDocDefaultSettings._codepage);
 			}
 
@@ -6965,6 +6998,9 @@ void NppParameters::feedGUIParameters(const NppXml::Element& element)
 			_nppGUI._fillFindWhatThreshold = getRangeDefaultAttribute(childNode, "fillFindWhatThreshold", 1, FINDREPLACE_MAXLENGTH - 1, _nppGUI._fillFindWhatThreshold);
 
 			_nppGUI._fillDirFieldFromActiveDoc = getBoolAttribute(childNode, "fillDirFieldFromActiveDoc");
+
+			// Compatibility for v8.9.9 - should be removed in the future release
+			_findHistory._incrementalSearchBarAtTop = getBoolAttribute(childNode, "incrementalSearchBarAtTop", _findHistory._incrementalSearchBarAtTop);
 		}
 		// <GUIConfig name="MISC" fileSwitcherWithoutExtColumn="no" fileSwitcherExtWidth="50" fileSwitcherWithoutPathColumn="no" fileSwitcherPathWidth="50"
 		// fileSwitcherNoGroups="no" backSlashIsEscapeCharacterForSql="yes" writeTechnologyEngine="1" isFolderDroppedOpenFiles="no" docPeekOnTab="no"
@@ -7783,7 +7819,7 @@ void NppParameters::createXmlTreeFromGUIParams()
 	{
 		const char* pStr = nullptr;
 
-		if (_nppGUI._fileAutoDetection & cdEnabledOld)
+		if (_nppGUI._fileAutoDetection & cdEnabled4AllFiles)
 		{
 			if ((_nppGUI._fileAutoDetection & cdAutoUpdate) && (_nppGUI._fileAutoDetection & cdGo2end))
 			{
@@ -7802,7 +7838,7 @@ void NppParameters::createXmlTreeFromGUIParams()
 				pStr = "yesOld";
 			}
 		}
-		else if (_nppGUI._fileAutoDetection & cdEnabledNew)
+		else if (_nppGUI._fileAutoDetection & cdEnabled4CurrentFile)
 		{
 			if ((_nppGUI._fileAutoDetection & cdAutoUpdate) && (_nppGUI._fileAutoDetection & cdGo2end))
 			{
@@ -7885,6 +7921,7 @@ void NppParameters::createXmlTreeFromGUIParams()
 		NppXml::setAttribute(GUIConfigElement, "format", static_cast<int>(_nppGUI._newDocDefaultSettings._format));
 		NppXml::setAttribute(GUIConfigElement, "encoding", _nppGUI._newDocDefaultSettings._unicodeMode);
 		NppXml::setAttribute(GUIConfigElement, "lang", _nppGUI._newDocDefaultSettings._lang);
+		NppXml::setAttribute(GUIConfigElement, "udl", _nppGUI._newDocDefaultSettings._udl);
 		NppXml::setAttribute(GUIConfigElement, "codepage", _nppGUI._newDocDefaultSettings._codepage);
 		setBoolAttribute(GUIConfigElement, "openAnsiAsUTF8", _nppGUI._newDocDefaultSettings._openAnsiAsUtf8);
 		setBoolAttribute(GUIConfigElement, "addNewDocumentOnStartup", _nppGUI._newDocDefaultSettings._addNewDocumentOnStartup);
@@ -8013,6 +8050,14 @@ void NppParameters::createXmlTreeFromGUIParams()
 		NppXml::Element GUIConfigElement = NppXml::createChildElement(newGUIRoot, "GUIConfig");
 		NppXml::setAttribute(GUIConfigElement, "name", "MenuBar");
 		NppXml::createChildText(GUIConfigElement, _nppGUI._menuBarShow ? "show" : "hide");
+	}
+
+	// <GUIConfig name="DialogFont" size="8" fontName="MS Shell Dlg" />
+	{
+		NppXml::Element GUIConfigElement = NppXml::createChildElement(newGUIRoot, "GUIConfig");
+		NppXml::setAttribute(GUIConfigElement, "name", "DialogFont");
+		NppXml::setAttribute(GUIConfigElement, "size", _nppGUI._fontDlgSize);
+		NppXml::setAttribute(GUIConfigElement, "fontName", _nppGUI._fontDlgName);
 	}
 
 	// <GUIConfig name="Caret" width="1" blinkRate="600" />
@@ -8306,9 +8351,15 @@ bool NppParameters::writeFindHistory()
 	setBoolAttribute(findHistoryRoot, "dotMatchesNewline", _findHistory._dotMatchesNewline);
 	setBoolAttribute(findHistoryRoot, "isSearch2ButtonsMode", _findHistory._isSearch2ButtonsMode);
 	setBoolAttribute(findHistoryRoot, "regexBackward4PowerUser", _findHistory._regexBackward4PowerUser);
+	setBoolAttribute(findHistoryRoot, "findDlgHighlightMatches", _findHistory._findDlgHighlightMatches);
 
 	setBoolAttribute(findHistoryRoot, "bookmarkLine", _findHistory._isBookmarkLine);
 	setBoolAttribute(findHistoryRoot, "purge", _findHistory._isPurge);
+
+	setBoolAttribute(findHistoryRoot, "incrementalMatchCase", _findHistory._isIncrementalMatchCase);
+	setBoolAttribute(findHistoryRoot, "incrementalHighlightAll", _findHistory._isIncrementalHighlightAll);
+	setBoolAttribute(findHistoryRoot, "incrementalCount", _findHistory._isIncrementalCount);
+	setBoolAttribute(findHistoryRoot, "incrementalSearchBarAtTop", _findHistory._incrementalSearchBarAtTop);
 
 	for (const auto& path : _findHistory._findHistoryPaths)
 	{
@@ -8959,6 +9010,10 @@ void NppParameters::writeStyle2Element(const Style& style2Write, Style& style2Sy
 	{
 		NppXml::setAttribute(element, "colorStyle", style2Write._colorStyle);
 	}
+	else
+	{
+		NppXml::removeAttribute(element, "colorStyle");
+	}
 
 	if (!style2Write._fontName.empty())
 	{
@@ -9060,6 +9115,10 @@ void NppParameters::insertUserLang2Tree(NppXml::Element& node, const UserLangCon
 		if (style2Write._colorStyle != COLORSTYLE_ALL)
 		{
 			NppXml::setAttribute(styleElement, "colorStyle", style2Write._colorStyle);
+		}
+		else
+		{
+			NppXml::removeAttribute(styleElement, "colorStyle");
 		}
 
 		if (!style2Write._fontName.empty())
@@ -9516,4 +9575,28 @@ void NppParameters::buildGupParams(std::wstring& params)
 
 	params += L" -errLogPath=";
 	params += L"\"%LOCALAPPDATA%\\Notepad++\\log\\securityError.log\"";
+}
+
+void UserLangContainer::startAtTheme()
+{
+	// don't reset to the theme colors if it's already been set
+	if (!_isUnset)
+		return;
+
+	NppParameters& nppParams = NppParameters::getInstance();
+	COLORREF fg = nppParams.getCurrentDefaultFgColor();
+	COLORREF bg = nppParams.getCurrentDefaultBgColor();
+
+	for (Style& st : _styles)
+	{
+		st._bgColor = bg;
+		st._fgColor = fg;
+
+		// make BG "transparent" by default, to discourage changing background accidentally;
+		//	but keep the _bgColor set, so that if they do un-transparent it, it starts at a reasonable default
+		st._colorStyle = COLORSTYLE_FOREGROUND;
+	}
+
+	// now that it's started at theme values, not "unset" anymore
+	_isUnset = false;
 }

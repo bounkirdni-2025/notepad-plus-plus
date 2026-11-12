@@ -65,6 +65,8 @@
 
 #endif
 
+#define DEFAULT_DLG_FONT L"MS Shell Dlg"
+
 class NativeLangSpeaker;
 
 /*!
@@ -497,6 +499,7 @@ struct NewDocDefaultSettings final
 	UniMode _unicodeMode = uniUTF8_NoBOM;
 	bool _openAnsiAsUtf8 = true;
 	LangType _lang = L_TEXT;
+	std::wstring _udl;
 	int _codepage = -1; // -1 when not using
 	bool _addNewDocumentOnStartup = false;
 	bool _useContentAsTabName = false;
@@ -741,7 +744,7 @@ struct NppGUI final
 	bool _finderShowOnlyOneEntryPerFoundLine = true;
 	bool _fif_ignoreunsavedChangesInOpenedFiles = false;
 
-	int _fileAutoDetection = cdEnabledNew;
+	int _fileAutoDetection = cdEnabled4CurrentFile;
 
 	bool _checkHistoryFiles = false;
 
@@ -890,6 +893,9 @@ struct NppGUI final
 	std::string _shortcutsOnDiskHmac;
 
 	bool _isFawSymlinkAllowed = false; // allow to open symlink files in FaW (Folder as Workspace) panel.
+
+	WORD _fontDlgSize = 8;
+	std::wstring _fontDlgName = DEFAULT_DLG_FONT;
 };
 
 
@@ -1028,7 +1034,7 @@ public:
 	UserLangContainer() noexcept :_name(L"new user define"), _ext(L""), _udlVersion(""), _isDarkModeTheme(false) {}
 
 	explicit UserLangContainer(const wchar_t* name, const wchar_t* ext, const char* udlVer, bool isDarkModeTheme) noexcept
-		: _name(name), _ext(ext), _udlVersion(udlVer), _isDarkModeTheme(isDarkModeTheme) {}
+		: _name(name), _ext(ext), _udlVersion(udlVer), _isDarkModeTheme(isDarkModeTheme), _isUnset(true) {}
 
 	UserLangContainer(const UserLangContainer& ulc) noexcept
 		: _styles(ulc._styles),
@@ -1040,13 +1046,14 @@ public:
 		_isCaseIgnored(ulc._isCaseIgnored),
 		_allowFoldOfComments(ulc._allowFoldOfComments),
 		_foldCompact(ulc._foldCompact),
-		_isDarkModeTheme(ulc._isDarkModeTheme)
+		_isDarkModeTheme(ulc._isDarkModeTheme),
+		_isUnset(ulc._isUnset)
 	{
 		for (Style& st : _styles)
 		{
-			if (st._bgColor == static_cast<COLORREF>(-1))
+			if (st._bgColor == static_cast<COLORREF>(STYLE_NOT_USED))
 				st._bgColor = white;
-			if (st._fgColor == static_cast<COLORREF>(-1))
+			if (st._fgColor == static_cast<COLORREF>(STYLE_NOT_USED))
 				st._fgColor = black;
 		}
 
@@ -1075,6 +1082,7 @@ public:
 			this->_allowFoldOfComments = ulc._allowFoldOfComments;
 			this->_foldCompact = ulc._foldCompact;
 			this->_isDarkModeTheme = ulc._isDarkModeTheme;
+			this->_isUnset = ulc._isUnset;
 			for (Style & st : this->_styles)
 			{
 				if (st._bgColor == static_cast<COLORREF>(-1))
@@ -1091,6 +1099,8 @@ public:
 		}
 		return *this;
 	}
+
+	void startAtTheme();
 
 	const wchar_t* getName() const { return _name.c_str(); }
 	const wchar_t* getExtention() const { return _ext.c_str(); }
@@ -1111,6 +1121,7 @@ private:
 	bool _allowFoldOfComments = false;
 	bool _foldCompact = false;
 	bool _isDarkModeTheme = false;
+	bool _isUnset = true;
 
 	// nakama zone
 	friend class Notepad_plus;
@@ -1178,8 +1189,18 @@ struct FindHistory final
 	bool _isBookmarkLine = false;
 	bool _isPurge = false;
 
+	bool _findDlgHighlightMatches = false;
 	// Allow regExpr backward search: this option is not present in UI, only to modify in config.xml
 	bool _regexBackward4PowerUser = false;
+
+	//----------------------------
+	// Incremental Search settings
+	//----------------------------
+	bool _isIncrementalMatchCase = false;
+	bool _isIncrementalHighlightAll = false;
+	bool _isIncrementalCount = true;
+
+	bool _incrementalSearchBarAtTop = false;
 };
 
 struct ColumnEditorParam final
@@ -1416,6 +1437,14 @@ public:
 
 	NppGUI & getNppGUI() {
 		return _nppGUI;
+	}
+
+	[[nodiscard]] WORD getDlgFontSize() const noexcept {
+		return std::clamp<WORD>(_nppGUI._fontDlgSize, 8U, 24U);
+	}
+
+	[[nodiscard]] const std::wstring& getDlgFontName() const noexcept {
+		return _nppGUI._fontDlgName;
 	}
 
 	const char* getWordList(LangType langID, int typeIndex) const {
@@ -1975,7 +2004,7 @@ public:
 	COLORREF getFindDlgStatusMsgColor(int colourIndex);
 
 	bool isServerAllowed(const char* path2check, bool bCaseSensitive = false);
-	bool getServerName(const std::string& path2check, std::string& serverNameOutput);
+	static bool getServerName(const std::string& path2check, std::string& serverNameOutput);
 
 private:
 	unsigned long _sintillaModEventMask = SC_MOD_DELETETEXT | SC_MOD_INSERTTEXT | SC_PERFORMED_UNDO | SC_PERFORMED_REDO | SC_MOD_CHANGEINDICATOR;

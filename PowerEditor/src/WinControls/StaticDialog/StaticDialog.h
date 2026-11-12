@@ -19,6 +19,8 @@
 
 #include <windows.h>
 
+#include <string>
+
 #include "Window.h"
 #include "dpiManagerV2.h"
 
@@ -54,7 +56,7 @@ class StaticDialog : public Window
 public :
 	~StaticDialog() override;
 
-	virtual void create(int dialogID, bool isRTL = false, bool msgDestParent = true, WORD fontSize = 8);
+	virtual void create(int dialogID, bool isRTL = false, bool msgDestParent = true, WORD fontSize = 0, const std::wstring& fontFace = L"");
 
 	virtual bool isCreated() const {
 		return (_hSelf != nullptr);
@@ -96,6 +98,9 @@ public :
 
 	DPIManagerV2& dpiManager() { return _dpiManager; }
 
+	[[nodiscard]] static std::wstring getSystemFontFaceName();
+	[[nodiscard]] static std::wstring getDlgTypeface();
+
 protected:
 	RECT _rc{};
 	DPIManagerV2 _dpiManager;
@@ -103,6 +108,6 @@ protected:
 	static intptr_t CALLBACK dlgProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 	virtual intptr_t CALLBACK run_dlgProc(UINT message, WPARAM wParam, LPARAM lParam) = 0;
 
-	HWND myCreateDialogIndirectParam(int dialogID, bool isRTL, WORD fontSize, DLGPROC myDlgProc = StaticDialog::dlgProc);
-	INT_PTR myCreateDialogBoxIndirectParam(int dialogID, bool isRTL, WORD fontSize = 8);
+	HWND myCreateDialogIndirectParam(int dialogID, bool isRTL, WORD fontSize, const std::wstring& fontFace = L"", DLGPROC myDlgProc = StaticDialog::dlgProc);
+	INT_PTR myCreateDialogBoxIndirectParam(int dialogID, bool isRTL, WORD fontSize = 0);
 };

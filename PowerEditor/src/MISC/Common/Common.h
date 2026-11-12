@@ -26,7 +26,7 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
-
+#include <cstdint>
 
 std::wstring folderBrowser(HWND parent, const std::wstring & title = L"", int outputCtrlID = 0, const wchar_t *defaultStr = NULL);
 std::wstring getFolderName(HWND parent, const wchar_t *defaultDir = NULL);
@@ -52,6 +52,7 @@ std::wstring BuildMenuFileName(int filenameLen, unsigned int pos, const std::wst
 std::string getFileContent(const wchar_t* file2read, bool* pbFailed = nullptr);
 std::wstring relativeFilePathToFullFilePath(const wchar_t *relativeFilePath);
 void writeFileContent(const wchar_t *file2write, const char *content2write);
+DWORD writeFileContentEx(const wchar_t* file2write, const char* content2write, size_t length);
 bool matchInList(const wchar_t *fileName, const std::vector<std::wstring> & patterns);
 bool matchInExcludeDirList(const wchar_t* dirName, const std::vector<std::wstring>& patterns, size_t level);
 bool allPatternsAreExclusion(const std::vector<std::wstring>& patterns);
@@ -151,9 +152,6 @@ class Buffer;
 bool buf2Clipboard(const std::vector<Buffer*>& buffers, bool isFullPath, HWND hwnd);
 
 std::wstring GetLastErrorAsString(DWORD errorCode = 0);
-
-std::wstring intToString(int val);
-std::wstring uintToString(unsigned int val);
 
 HWND createToolTip(int toolID, HWND hDlg, HINSTANCE hInst, wchar_t* pszText, bool isRTL);
 HWND createToolTipRect(int toolID, HWND hWnd, HINSTANCE hInst, wchar_t* pszText, const RECT rc);
@@ -351,3 +349,12 @@ private:
 
 
 bool needsElevation4Access(const std::wstring& path2check, bool bWriteAccess);
+
+
+
+constexpr DWORD   NPP_COPYDATA_CONFIRM = 0x4E50C0DE;   // must differ from the COPYDATA_* values
+constexpr LRESULT NPP_CONFIRM_MAGIC = 0x4E504F4B;   // "yes, I sent exactly that"; TRUE/1 is not accepted as a yes
+using NppDigest = std::array<uint8_t, 32>;
+
+// SHA-256 over (dwData, cbData, bytes): binds the message type and length as well as the content
+bool nppCopyDataDigest(ULONG_PTR dwData, const void* data, DWORD cb, NppDigest& out);
